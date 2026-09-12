@@ -346,13 +346,13 @@ home_state (新模块,src/core/home_state.cppm)
 
 ## 6. 分期与 PR 切分
 
-| 期 | 内容 | 关闭的 issue | 风险 |
-|---|---|---|---|
-| **1** | P0 全部 + `home_state` 骨架(stamps + notices) | — | 低;纯输出与元数据 |
-| **2** | P1(overlay provenance + 三个动词 + 陈旧退场) | #564 的一半 | 低;新增命令 |
-| **3** | P2(remove 反转顺序 + `--all`/`--subos`/`--force` 扩义) | #578、#506 | **中**;动删除顺序,需 I4 先落 |
-| **4** | P3(D1 默认模式跑 probe、D2 未引用即 prune、doctor 全 home、`--fix` 跨 subos、`--all` 改名) | #586(两侧) | 中;D1/D2 可先单独出一个小 PR,收益最大 |
-| **5** | P4 + P5(fixture、sanitizer、三平台 contract) | #433、#582、#427 的一部分 | 低,但 CI 时间 +10–15 min |
+| 期 | 内容 | 关闭的 issue | 风险 | 实施 |
+|---|---|---|---|---|
+| **1** | P0 全部 + `home_state` 骨架(stamps + notices) | — | 低;纯输出与元数据 | PR: this branch (fix/robustness-usability-2026.9.12), pkgindex PR #826 |
+| **2** | P1(overlay provenance + 三个动词 + 陈旧退场) | #564 的一半 | 低;新增命令 | PR: this branch (fix/robustness-usability-2026.9.12), pkgindex PR #826 |
+| **3** | P2(remove 反转顺序 + `--all`/`--subos`/`--force` 扩义) | #578、#506 | **中**;动删除顺序,需 I4 先落 | PR: this branch (fix/robustness-usability-2026.9.12), pkgindex PR #826 |
+| **4** | P3(D1 默认模式跑 probe、D2 未引用即 prune、doctor 全 home、`--fix` 跨 subos、`--all` 改名) | #586(两侧) | 中;D1/D2 可先单独出一个小 PR,收益最大 | PR: this branch (fix/robustness-usability-2026.9.12), pkgindex PR #826 |
+| **5** | P4 + P5(fixture、sanitizer、三平台 contract) | #433、#582、#427 的一部分 | 低,但 CI 时间 +10–15 min | PR: this branch (fix/robustness-usability-2026.9.12), pkgindex PR #826 |
 
 期 1、2 可并行;期 3 依赖 I4 的测试先写;期 4 依赖 `home_state.subos.with_scope`。
 
@@ -385,6 +385,14 @@ home_state (新模块,src/core/home_state.cppm)
 4. 我以为 `local:` 的堆积和 mcpp 的构建流程有关(Q6)。三个 mcpp 工作树里没有一处 `--add-xpkg`;
    来源是 pkgindex 的 recipe 测试 skill,它有「加」没有「删」。修的地方在 xlings(P1)和 pkgindex 的一行文档,
    不在 mcpp。
+5. 跨 subos 的 doctor e2e 一开始靠一个「打戳」helper 直接在 fixture 里写版本记录,那个 helper 读的是
+   **旧的** `version` 字段。测试在旧写法下也能通过,但它锁的是「这个 helper 恰好写成了什么样子」,不是
+   「doctor 认得这条记录处于什么状态」这个不变量——helper 和被测代码用两套字段名互相凑巧对上了。
+   换成真实的写路径(而不是手写 fixture JSON)之后,这条测试才第一次真正对被测行为断言。
+6. doctor 默认报告为了省 §1.3 量出来的 2 s,把「这条记录有没有可跑的修复动作」这个 probe 挂在了
+   `--deep` 后面——于是默认输出对每一条它自己判定为「有问题」的记录,只要没跑 probe 就一律打印
+   「no remedy」,在一个真实 home 上变成 100 行清一色的假阴性:不是真的修不了,是根本没问过。
+   代价省错了地方:省的是 2 s 的探测开销,付出的是「默认体检报告不可信」。
 
 ## 9. 附:本次的度量方法(可复跑)
 

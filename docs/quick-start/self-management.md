@@ -49,6 +49,10 @@ xlings self doctor
 xlings self doctor --all
 ```
 
+两个 flag 用来收窄或放宽体检范围（部分较新客户端才有，`--help` 可确认
+是否已支持）：`--subos <NAME>` 只体检指定的那个 SubOS，而不是当前这个；
+`--show-ok` 连"完全正常"的项也逐条打印，而不是默认那样合并成一行计数。
+
 ## 修复
 
 ```bash
