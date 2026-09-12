@@ -1673,9 +1673,22 @@ ScopedSubosOverride::~ScopedSubosOverride() {
     // see the restored value. Restoring the override first would resolve
     // against the env var THIS GUARD is still holding, landing back on the
     // subos being left instead of the one being returned to.
-    platform::set_env_variable("XLINGS_ACTIVE_SUBOS", prevEnv_);
-    (void)Config::set_active_subos_override(prevOverride_);
-    Config::reload_state();
+    //
+    // This destructor is implicitly `noexcept` (no exception-specifier says
+    // otherwise), but everything it calls can throw. A restore failure
+    // during stack unwinding must not escalate to `std::terminate` -- the
+    // caller is already handling (or propagating) some other failure, and
+    // losing the whole process over "couldn't restore which subos is
+    // active" would replace a recoverable state with an unrecoverable one.
+    try {
+        platform::set_env_variable("XLINGS_ACTIVE_SUBOS", prevEnv_);
+        (void)Config::set_active_subos_override(prevOverride_);
+        Config::reload_state();
+    } catch (const std::exception& e) {
+        log::debug("ScopedSubosOverride: restore failed: {}", e.what());
+    } catch (...) {
+        log::debug("ScopedSubosOverride: restore failed (unknown exception)");
+    }
 }
 
 int cmd_search(const std::string& keyword, EventStream& stream) {
@@ -2300,6 +2313,7 @@ int cmd_list_xpkg() {
             case overlay::Status::Identical: return "identical";
             case overlay::Status::Modified:  return "modified";
             case overlay::Status::Behind:    return "behind";
+            case overlay::Status::Missing:   return "missing";
         }
         return "unique";
     };
@@ -2321,18 +2335,30 @@ int cmd_list_xpkg() {
 
 int cmd_remove_xpkg(const std::string& name) {
     auto dir = overlay::dir();
-    auto entries = overlay::load(dir);
-    auto localFile = overlay::recipe_path(dir, name);
-    std::error_code ec;
-    bool hadFile = std::filesystem::is_regular_file(localFile, ec);
-    auto it = entries.find(name);
-    if (!hadFile && it == entries.end()) {
+    // `load_with_files`, not `recipe_path(dir, name)` directly: the same
+    // reason `--list-xpkg` and `--clear-xpkg` already use it. An untracked
+    // overlay recipe (no `.overlay.json` entry -- everything a
+    // pre-2026.9.12 `--add-xpkg` ever added, or a file dropped into pkgs/
+    // by hand) can live somewhere `recipe_path` would not reconstruct from
+    // its declared name alone (see `DiscoveredEntry`'s comment), so
+    // `--list-xpkg` could show it while `--remove-xpkg` on that same name
+    // found nothing to delete.
+    auto discovered = overlay::load_with_files(dir);
+    auto found = overlay::find_entry(discovered, name);
+    if (!found) {
         log::error("no local recipe named '{}'", name);
         return 1;
     }
-    overlay::remove_recipe_file(localFile);
-    if (it != entries.end()) entries.erase(it);
-    overlay::save(dir, entries);
+    overlay::remove_recipe_file(found->path);
+    // Only a TRACKED entry has a provenance record to drop -- adopting an
+    // untracked one into `.overlay.json` here, just because it was looked
+    // up, is exactly what `gc_identical`/`--clear-xpkg` are careful not to
+    // do for a surviving untracked recipe.
+    if (found->tracked) {
+        auto entries = overlay::load(dir);
+        entries.erase(name);
+        overlay::save(dir, entries);
+    }
 
     log::println("removed local recipe '{}'", name);
     get_catalog().rebuild();
@@ -2360,8 +2386,14 @@ int cmd_clear_xpkg(const std::string& what) {
         bool shouldRemove = what == "all";
         if (!shouldRemove) {
             auto status = overlay::status_of(item.entry, item.path);
+            // Missing joins Identical/Behind here: a tracked entry whose
+            // file is already gone is provenance garbage too -- there is
+            // nothing left to compare, only a `.overlay.json` record to
+            // drop (`remove_recipe_file` on an already-gone file is a
+            // documented no-op).
             shouldRemove = status.kind == overlay::Status::Identical
-                        || status.kind == overlay::Status::Behind;
+                        || status.kind == overlay::Status::Behind
+                        || status.kind == overlay::Status::Missing;
         }
         if (!shouldRemove) continue;
         overlay::remove_recipe_file(item.path);

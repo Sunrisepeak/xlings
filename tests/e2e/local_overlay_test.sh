@@ -166,6 +166,46 @@ if run_x config --remove-xpkg no-such-package >"$s5b_out" 2>&1; then
 fi
 echo "   ok — refused"
 
+echo "== S5c: --remove-xpkg reaches an UNTRACKED overlay recipe =="
+# No add-xpkg, no .overlay.json entry -- dropped straight into pkgs/, the
+# 157-of-159 shape a pre-2026.9.12 build leaves behind. --list-xpkg already
+# shows this; --remove-xpkg must be able to delete it by the same name.
+mkdir -p "$HOME_DIR/data/xim-pkgindex-local/pkgs/z"
+cat > "$HOME_DIR/data/xim-pkgindex-local/pkgs/z/zz-untrackedpkg.lua" <<'LUA'
+package = {
+    spec = "1",
+    name = "zz-untrackedpkg",
+    description = "overlay e2e fixture: dropped in with no add-xpkg",
+    type = "config",
+    archs = {"x86_64"},
+    status = "dev",
+    xpm = {
+        linux   = { ["latest"] = { ref = "1.0.0" }, ["1.0.0"] = {} },
+        macosx  = { ["latest"] = { ref = "1.0.0" }, ["1.0.0"] = {} },
+        windows = { ["latest"] = { ref = "1.0.0" }, ["1.0.0"] = {} },
+    },
+}
+function install() return true end
+function config() return true end
+function uninstall() return true end
+LUA
+
+out="$(run_x config --list-xpkg 2>&1)"
+grep "^zz-untrackedpkg " <<<"$out" | grep -qi "untracked" \
+    || { echo "$out"; fail "S5c: zz-untrackedpkg should list with an 'untracked' source"; }
+
+rc=0
+out="$(run_x config --remove-xpkg zz-untrackedpkg 2>&1)" || rc=$?
+if [[ $rc -ne 0 ]]; then
+    echo "$out"
+    fail "S5c: --remove-xpkg on an untracked recipe should exit 0"
+fi
+grep -qi "zz-untrackedpkg" <<<"$out" || { echo "$out"; fail "S5c: remove should name the package"; }
+if [[ -f "$HOME_DIR/data/xim-pkgindex-local/pkgs/z/zz-untrackedpkg.lua" ]]; then
+    fail "S5c: --remove-xpkg should have deleted the untracked file"
+fi
+echo "   ok — untracked entry removed by name"
+
 echo "== S6: 'xlings update' auto-GCs an entry that becomes identical =="
 cp "$UPSTREAM_RECIPE" "$LOCAL_SRC/make-again.lua"
 sed -i.bak 's/GNU Make v4.4 —/GNU Make v4.4 (about to converge) —/' "$LOCAL_SRC/make-again.lua"
