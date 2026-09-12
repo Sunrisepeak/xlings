@@ -1077,3 +1077,33 @@ TEST(XimSelectVersionAlias, AnAliasToAMissingKeyStillNamesItsTarget) {
     EXPECT_EQ(xlings::xim::detail_::select_version_(pkg, "linux", ">=1"),
               "2.0.0");
 }
+
+// 2026.9.12 F6: concrete_versions_ used to follow exactly ONE ref hop, so a
+// CHAIN of aliases ("8" -> "8.0" -> "8.0.1", the real, concrete key) left
+// ">=8" resolving to "8.0" -- itself just another name, never a directory
+// the store created. Fixed to follow the chain to its end.
+TEST(XimSelectVersionAlias, ChainedAliasResolvesToItsConcreteEnd) {
+    mcpplibs::xpkg::Package pkg;
+    pkg.name = "openjdk-chain";
+    pkg.spec = "1";
+    mcpplibs::xpkg::PlatformResource real;
+    real.url = "https://example.com/jdk-8.0.1.tar.gz";
+    mcpplibs::xpkg::PlatformResource middleAlias;
+    middleAlias.ref = "8.0.1";
+    mcpplibs::xpkg::PlatformResource headAlias;
+    headAlias.ref = "8.0";
+    pkg.xpm.entries["linux"]["8.0.1"] = real;
+    pkg.xpm.entries["linux"]["8.0"] = middleAlias;
+    pkg.xpm.entries["linux"]["8"] = headAlias;
+
+    // A range hint that only "8"'s chain can satisfy: >=8 must land on the
+    // real, concrete "8.0.1" -- not on "8.0", the middle link, which is
+    // itself just another alias and was never installed on its own.
+    //
+    // (Exact-match hints ("8", "8.0") go through select_version_'s OWN
+    // direct-lookup branch, a separate one-hop dereference this finding
+    // does not touch -- concrete_versions_ backs the range/prefix branch
+    // only, which is what this asserts.)
+    EXPECT_EQ(xlings::xim::detail_::select_version_(pkg, "linux", ">=8"),
+              "8.0.1");
+}
