@@ -220,6 +220,25 @@ TESTS=(
     # guard: this does not reproduce against HEAD (already per-subos-aware),
     # so this asserts the correct behaviour rather than a fix.
     "E2E-107|second_subos_install_test.sh||"
+    # R3's terminal outcome -- `remove --force` genuinely drops the
+    # registration and the reinstall meant to put it back fails too -- must
+    # fail `--fix` and withhold `verifiedBy`. Before this, `outstanding`
+    # only counted a failed entry if it was STILL a finding after
+    # re-detection, and a fully removed registration is never a finding
+    # again: the run exited 0 having taken a package out and left it out
+    # (2026.9.12 finding F1).
+    "E2E-108|doctor_removed_not_reinstalled_test.sh||"
+    # The CURRENT subos itself corrupted, not a sibling -- Config's own
+    # writer of its active subos's `.xlings.json` used to blank the file
+    # on the first ordinary write after that, exactly what
+    # profile::save_subos_workspace has always refused for every OTHER
+    # subos (2026.9.12 finding F10).
+    "E2E-109|current_subos_unreadable_test.sh||"
+    # A cross-subos `--fix` child (repair_other_subos_walk_) had no bound
+    # at all; a hung child hung the parent right along with it. Now
+    # bounded (XLINGS_DOCTOR_CHILD_TIMEOUT, default 30 min) and reported
+    # as a failure, not silently waited on forever (2026.9.12 finding F8).
+    "E2E-110|doctor_cross_subos_child_timeout_test.sh||"
 )
 
 # ── orphan check: a test that runs NOWHERE looks exactly like one that passes ──
