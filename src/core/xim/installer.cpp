@@ -1318,6 +1318,16 @@ std::vector<std::filesystem::path> workspace_config_paths_for_scope_(PackageScop
 bool is_version_referenced_anywhere_(PackageScope scope, const std::string& target, const std::string& version, const std::filesystem::path& excludePath, bool force) {
     std::error_code ec;
     auto excludeCanonical = excludePath.empty() ? std::filesystem::path{} : std::filesystem::weakly_canonical(excludePath, ec);
+
+    // Collected across the WHOLE scan before any decision is reported --
+    // not returned on the first hit. `pinned_by`'s own report (see
+    // find_subos_pinning_version, cmd_remove_resolved_) already lists every
+    // unreadable subos it found; this function used to stop at the first
+    // one and warn about only that name, so the decision-time diagnostic
+    // and the follow-up report disagreed about how many subos were even in
+    // question -- one name here, all of them there.
+    std::vector<std::string> unreadable;
+
     for (auto& configPath : workspace_config_paths_for_scope_(scope)) {
         auto canonical = std::filesystem::weakly_canonical(configPath, ec);
         if (!excludeCanonical.empty() && !ec && canonical == excludeCanonical) {
@@ -1348,23 +1358,15 @@ bool is_version_referenced_anywhere_(PackageScope scope, const std::string& targ
         // object" -- it does not mean "delete a payload a DIFFERENT,
         // unrelated subos may still need". That would be damaging that
         // other subos's state, not forcing this removal.
+        //
+        // Recorded and the scan CONTINUES: a later subos in this same
+        // pass may still supply a definite match, and even if none does,
+        // every unreadable name found belongs in the one warning below,
+        // not just whichever happened to sort first.
         auto checkedSws = load_workspace_file_checked_(configPath);
         if (!checkedSws) {
-            auto subosName = configPath.parent_path().filename().string();
-            log::warn(
-                "{}: its workspace file ({}) could not be read, so it is "
-                "not known whether it still uses {}@{} -- treating it as "
-                "still referencing the payload and keeping it (detach-only) "
-                "rather than risk deleting something that subos needs.{} "
-                "Run `xlings self doctor --subos {}` to repair it.",
-                subosName, configPath.string(), target, version,
-                force ? " --force does not override this: deleting a "
-                        "payload another subos may need is not \"force "
-                        "removing this package\", it is damaging that "
-                        "other subos."
-                      : "",
-                subosName);
-            return true;
+            unreadable.push_back(configPath.parent_path().filename().string());
+            continue;
         }
         // 0.4.19+: a payload is "referenced" by a subos if EITHER its
         // active version equals `version` OR `version` appears in that
@@ -1394,7 +1396,37 @@ bool is_version_referenced_anywhere_(PackageScope scope, const std::string& targ
             }
         }
     }
-    return false;
+
+    if (unreadable.empty()) return false;
+
+    std::string names;
+    std::string commands;
+    for (const auto& n : unreadable) {
+        if (!names.empty()) names += ", ";
+        names += n;
+        if (!commands.empty()) commands += "; ";
+        // One runnable command per subos, not a "<name>" placeholder: a
+        // printed remedy has to be something the reader can paste, and
+        // "repair each of these" is not that when there is more than one.
+        commands += std::format("xlings self doctor --subos {}", n);
+    }
+    log::warn(
+        "{} — {} workspace file could not be read, so it is not known "
+        "whether {} still uses {}@{} -- treating it as still referencing "
+        "the payload and keeping it (detach-only) rather than risk "
+        "deleting something {} needs.{} Run `{}` to repair it.",
+        names,
+        unreadable.size() == 1 ? "its" : "their",
+        unreadable.size() == 1 ? "it" : "one of them",
+        target, version,
+        unreadable.size() == 1 ? "it" : "one of them",
+        force ? " --force does not override this: deleting a "
+                "payload another subos may need is not \"force "
+                "removing this package\", it is damaging that "
+                "other subos."
+              : "",
+        commands);
+    return true;
 }
 
 void remove_target_shims_(const std::string& target, const std::string& version) {
