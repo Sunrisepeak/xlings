@@ -13,6 +13,7 @@ import std;
 import xlings.core.xself.repair;
 import xlings.core.xself.update;
 
+using xlings::xself::Dependent;
 using xlings::xself::RepairKind;
 using xlings::xself::RepairPolicy;
 using xlings::xself::RepairTask;
@@ -223,6 +224,102 @@ TEST(SelfRepairLadder, ReportsRemovedWhenTheFollowUpInstallFails) {
     EXPECT_EQ(r.rung, "reinstall");
     EXPECT_NE(r.note.find("REMOVED but could not reinstall"),
               std::string::npos) << r.note;
+}
+
+// F7 (2026.9.12): the terminal, worst-case outcome also names what it may
+// have broken. The dependents provider is asked ONLY here -- see the next
+// test -- and its answer lands on the result, not folded into `note`'s own
+// wording, so a caller can render it however it wants.
+TEST(SelfRepairLadder, RemovedButCouldNotReinstallNamesItsDependents) {
+    FakeRunner f{.codes = {1, 0, 1}};
+    bool consulted = false;
+    auto r = repair_one(task(), RepairPolicy{}, runner_of(f),
+                        [](const std::string&, const std::string&) {
+                            return true;    // really gone
+                        },
+                        [&](const std::string& target) {
+                            consulted = true;
+                            EXPECT_EQ(target, "linux-headers");
+                            return std::vector<Dependent>{
+                                {"gcc", "16.1.0"}, {"binutils", "2.42"}};
+                        });
+
+    EXPECT_FALSE(r.healed);
+    EXPECT_EQ(r.rung, "reinstall");
+    ASSERT_EQ(r.dependents.size(), 2u);
+    EXPECT_EQ(r.dependents[0].name, "gcc");
+    EXPECT_EQ(r.dependents[0].version, "16.1.0");
+    EXPECT_EQ(r.dependents[1].name, "binutils");
+    EXPECT_TRUE(consulted);
+}
+
+// Asked ONLY for that one outcome -- not for a healthy re-register, not for
+// a reinstall that actually succeeded, and not for the OTHER `!healed`
+// shape ("remove --force did not drop it"). Paying for a dependents lookup
+// on every ladder run just to answer a question nobody asked would be the
+// wrong trade for what is otherwise a rare, worst-case diagnostic.
+TEST(SelfRepairLadder, DependentsProviderIsNotConsultedWhenNotNeeded) {
+    {
+        FakeRunner f{.codes = {0}};   // R2 succeeds
+        bool consulted = false;
+        auto r = repair_one(task(), RepairPolicy{}, runner_of(f), nullptr,
+                            [&](const std::string&) {
+                                consulted = true;
+                                return std::vector<Dependent>{};
+                            });
+        EXPECT_TRUE(r.healed);
+        EXPECT_FALSE(consulted) << "re-register alone healed it";
+        EXPECT_TRUE(r.dependents.empty());
+    }
+    {
+        FakeRunner f{.codes = {1, 0, 0}};   // R3 reinstall succeeds
+        bool consulted = false;
+        auto r = repair_one(task(), RepairPolicy{}, runner_of(f),
+                            [](const std::string&, const std::string&) {
+                                return true;    // really gone, and put back
+                            },
+                            [&](const std::string&) {
+                                consulted = true;
+                                return std::vector<Dependent>{};
+                            });
+        EXPECT_TRUE(r.healed);
+        EXPECT_FALSE(consulted) << "the reinstall succeeded; nothing broke";
+        EXPECT_TRUE(r.dependents.empty());
+    }
+    {
+        // "remove --force did not drop it", and the reinstall that followed
+        // happened to succeed anyway -- rung "reinstall", !healed (see
+        // ReinstallsEvenWhenTheRecordSurvivedRemoval above), but NOT the
+        // removed-for-real outcome this provider is about: the record
+        // survived, so nothing was actually removed.
+        FakeRunner f{.codes = {1, 0, 0}};
+        bool consulted = false;
+        auto r = repair_one(task(), RepairPolicy{}, runner_of(f),
+                            [](const std::string&, const std::string&) {
+                                return false;   // still registered
+                            },
+                            [&](const std::string&) {
+                                consulted = true;
+                                return std::vector<Dependent>{};
+                            });
+        EXPECT_FALSE(r.healed);
+        EXPECT_EQ(r.rung, "reinstall");
+        EXPECT_FALSE(consulted) << "the record survived; nothing was removed";
+        EXPECT_TRUE(r.dependents.empty());
+    }
+}
+
+// A caller that supplies nothing gets the old behaviour: no dependents, no
+// crash from an unset std::function. This is what every OTHER test above
+// (written before this provider existed) already relies on.
+TEST(SelfRepairLadder, NoDependentsProviderMeansNoDependentsReported) {
+    FakeRunner f{.codes = {1, 0, 1}};
+    auto r = repair_one(task(), RepairPolicy{}, runner_of(f),
+                        [](const std::string&, const std::string&) {
+                            return true;
+                        });
+    EXPECT_FALSE(r.healed);
+    EXPECT_TRUE(r.dependents.empty());
 }
 
 TEST(SelfRepairLadder, ProceedsWhenTheVerifierConfirmsTheRemoval) {
