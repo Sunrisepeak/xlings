@@ -93,7 +93,7 @@ DoctorState load_state_() {
     // itself as a foreigner.
     std::error_code cec;
     const auto here = fs::weakly_canonical(p.subosDir, cec);
-    for (auto& snapshot : profile::load_subos_snapshots(p.homeDir)) {
+    for (auto& snapshot : profile::load_subos_snapshots(p.homeDir, &st.unreadableSubos)) {
         std::error_code sec;
         if (fs::weakly_canonical(snapshot.dir, sec) == here) continue;
         st.otherSubos.push_back(xvm::SubosRef{
@@ -2396,6 +2396,25 @@ Scan detect_(const DoctorState& st, const CoordinateProbe& probe,
         });
     }
 
+    // One broken package must not break the others: an unparsable
+    // subos/<name>/.xlings.json used to be a silent `catch (...) {}` in
+    // load_subos_snapshots(). Reported here instead, one Warning per name, so
+    // a hand-edit mistake shows up instead of quietly dropping that subos out
+    // of every cross-subos question.
+    for (const auto& name : st.unreadableSubos) {
+        add({
+            .kind       = FindingKind::SubosUnreadable,
+            .level      = FindingLevel::Warning,
+            .target     = name,
+            .detail     = std::format("subos '{}' has an unreadable {}",
+                                       name,
+                                       Config::display_path(
+                                           p.homeDir / "subos" / name / ".xlings.json")),
+            .remedyNote = "fix the JSON by hand or `xlings subos remove "
+                          + name + "`",
+        });
+    }
+
     // The one finding says how many symptoms it stands for.
     //
     // Patched here rather than formatted at the top, because the link count is
@@ -3907,6 +3926,10 @@ Counts count_(const Scan& scan) {
                 // rather than as "healed 0" with a list of things it did.
                 if (duplicateReleases.insert(f.groupKey).second) ++c.binding;
                 break;
+            // A Warning, not an Error: the unreadable subos is one package's
+            // worth of damage, and it must not move the exit code the way an
+            // Error-level finding would.
+            case FindingKind::SubosUnreadable: ++c.warnings; break;
         }
     }
     return c;
@@ -4281,6 +4304,11 @@ void render_(const Scan& scan, const RepairReport& repair, bool fix,
                     add("  " + glyph::mark(glyph::note, "note"), f.remedyNote);
                 break;
             }
+            case FindingKind::SubosUnreadable:
+                add(glyph::mark(glyph::warn, "subos unreadable"), f.detail);
+                if (!f.remedyNote.empty())
+                    add("  " + glyph::mark(glyph::note, "note"), f.remedyNote);
+                break;
             default: break;
         }
     }

@@ -194,6 +194,15 @@ TESTS=(
     # recipe's uninstall() runs, and --force/--all/--all-subos make "removed"
     # mean removed no matter what shape the home is in (2026.9.12 Task 5).
     "E2E-102|remove_force_contract_test.sh||"
+    # E2E-102..105 belong to other tasks of the 2026-09-12 robustness/
+    # usability round, not yet merged in every worktree.
+    #
+    # Four kinds of damage at once -- an unreadable subos, a DB entry for a
+    # package never installed, a deleted overlay recipe file, and a real
+    # package's xvm record pointed at a missing bin dir -- and a snapshot of
+    # an untouched sibling package proving none of it spread. Task 8 of the
+    # 2026-09-12 robustness/usability round.
+    "E2E-106|broken_home_isolation_test.sh||"
 )
 
 # ── orphan check: a test that runs NOWHERE looks exactly like one that passes ──

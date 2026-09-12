@@ -293,6 +293,16 @@ enum class FindingKind {
     // changed. Readers collapse the pair now; `--fix` merges it. Measured on
     // a real home: 240 such pairs, and `use` was landing on the wrong half.
     DuplicateVersionKey,
+    // A `subos/<name>/.xlings.json` that load_subos_snapshots() could not
+    // turn into a snapshot: invalid JSON, not an object, or missing the
+    // `workspace` field. Used to be skipped with `catch (...) {}` and never
+    // reported anywhere -- a hand-edit mistake in ONE subos silently dropped
+    // it from every cross-subos question (reference counting, `list --all`,
+    // this very audit) with no signal that it had happened. Warning, not
+    // Error: the rest of this subos and every OTHER subos are unaffected,
+    // which is the point -- one broken subos must not change what other
+    // commands report for the rest of the home.
+    SubosUnreadable,
 };
 
 enum class FindingLevel {
@@ -347,6 +357,9 @@ struct DoctorState {
     xvm::WorkspaceInstalled  wsInstalled;
     std::vector<xvm::SubosRef>          otherSubos;
     std::vector<profile::SubosSnapshot> otherSnapshots;
+    // Names of subos directories under this home whose .xlings.json exists
+    // but could not be read as one -- see FindingKind::SubosUnreadable.
+    std::vector<std::string>            unreadableSubos;
     fs::path                 xlingsBin;
     std::string              homeStr;
     // Computed once per state load, consumed by detection AND by both

@@ -63,11 +63,20 @@ export struct SubosSnapshot {
 
 // Every subos under a home, in name order.
 //
-// Unreadable and malformed files are SKIPPED, not reported: this feeds
-// read-only inspection and reference counting, and a subos whose config a
-// user hand-edited into invalid JSON must not take down an unrelated
-// `remove`. `current` is a symlink to the active one and would double-count.
-export std::vector<SubosSnapshot> load_subos_snapshots(const fs::path& xlingsHome);
+// Unreadable and malformed files are SKIPPED from the returned snapshots:
+// this feeds read-only inspection and reference counting, and a subos whose
+// config a user hand-edited into invalid JSON must not take down an
+// unrelated `remove`. `current` is a symlink to the active one and would
+// double-count.
+//
+// `unreadable`, when given, collects the name of every subos directory whose
+// `.xlings.json` exists but could not be turned into a snapshot -- parse
+// failure, an exception, or a missing `workspace` field -- so a caller that
+// wants to surface the problem (doctor, `list --all`) can, without this
+// function's callers that only want the readable set having to change.
+export std::vector<SubosSnapshot> load_subos_snapshots(
+        const fs::path& xlingsHome,
+        std::vector<std::string>* unreadable = nullptr);
 
 // Write one other subos's workspace back, preserving everything else in its
 // state file.
