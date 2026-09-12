@@ -43,9 +43,7 @@ std::optional<std::string> migration_hint(std::string_view recorded,
     // at all, or one written by a build that never set it, would otherwise
     // nag forever with nothing to compare against.
     if (a.empty() || b.empty() || a == b) return std::nullopt;
-    return std::format(
-        "this home was set up by {}; packages installed then may still be "
-        "registered in its format\n  run  xlings self doctor --fix", a);
+    return std::format("set up by {}; last verified by {}", a, b);
 }
 
 RepairResult repair_one(const RepairTask& task, const RepairPolicy& policy, const CommandRunner& run, const RemovalVerifier& removalDone) {
@@ -134,17 +132,6 @@ RepairResult repair_one(const RepairTask& task, const RepairPolicy& policy, cons
     return {false, "reinstall",
             std::format("REMOVED but could not reinstall — run "
                         "`xlings install {}`", coordinate)};
-}
-
-void print_migration_hint_once(std::string_view recorded,
-                               std::string_view running) {
-    static bool shown = false;
-    if (shown) return;
-    if (!platform::supports_rewrite_output()) return;  // not a terminal
-    auto hint = migration_hint(recorded, running);
-    if (!hint) return;
-    shown = true;
-    log::info("{}", *hint);
 }
 
 }

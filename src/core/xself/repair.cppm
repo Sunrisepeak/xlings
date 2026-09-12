@@ -119,16 +119,19 @@ bool probe_reinstallable(const std::string& target,
                          const CommandRunner& run,
                          const std::string& client = "xlings");
 
-// The one-line nudge toward `self doctor --fix`.
+// A fact for `self doctor`'s report: which client set this home up, and which
+// one last confirmed its registrations are readable in the running format.
 //
-// The home config records which xlings set it up. When that differs from the
-// running binary, packages registered by the older client may still be in its
-// format -- which is what the repair ladder exists to migrate. A string
-// comparison: no network, and no extra file read, because the home config is
-// already loaded by every command.
+// A pure function so doctor's report is unit-testable without a home. It
+// used to compare "recorded" against the RUNNING version and word itself as
+// a command to type (`run xlings self doctor --fix`) -- but doctor is the one
+// place that command is redundant with the report it is already part of, and
+// the comparison against "running" meant the hint could never go quiet on
+// its own between an upgrade and the next `--fix`. It now states the two
+// facts and lets the caller decide what, if anything, to say about them.
 //
-// Returns nothing when the versions agree, which is what makes the hint stop
-// appearing after a successful --fix stamps the field.
+// Returns nothing when the two agree, which is what makes a doctor report
+// stop mentioning it once `--fix` has actually verified the current client.
 std::optional<std::string> migration_hint(std::string_view recorded,
                                           std::string_view running);
 
@@ -159,27 +162,5 @@ RepairResult repair_one(const RepairTask& task,
                         const RepairPolicy& policy,
                         const CommandRunner& run,
                         const RemovalVerifier& removalDone = nullptr);
-
-// The nudge, emitted from the commands a user actually runs.
-//
-// `self doctor` already prints it, but that only reaches someone who suspects
-// something is wrong -- and the whole point of this work is that they should
-// not have to. `self update` cannot print it either: it runs the OLD binary,
-// which has never heard of any of this. So the only place the migration can
-// announce itself to the cohort being migrated is the new binary, on the next
-// ordinary command.
-//
-// Deliberately narrow, because a nag that shows up in the wrong place is
-// worse than no nag:
-//
-//   - once per process. Three call sites, one line of output.
-//   - TTY only. This must never land in a pipe, a log or a CI transcript --
-//     it is advice for a person, and `xlings list | grep` is not a person.
-//   - silent when the versions agree, which is what makes a successful
-//     `--fix` turn it off for good rather than merely quieten it.
-//
-// No network and no extra file read beyond the one the config already did.
-void print_migration_hint_once(std::string_view recorded,
-                               std::string_view running);
 
 } // namespace xlings::xself

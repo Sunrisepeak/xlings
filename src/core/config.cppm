@@ -372,10 +372,12 @@ public:
 
     // One-shot hints, remembered ACROSS RUNS.
     //
-    // `xself::print_migration_hint_once` is a `static bool` -- per process, so
-    // reusing it for "show this the first time ever" would show it every time.
-    // An array rather than a bool per hint: these will not stay singular, and
-    // a list means adding one does not change the schema.
+    // A per-process `static bool` -- which `xself`'s old migration-hint
+    // helper used, and `xlings.core.notice`'s decision table is built to
+    // replace -- shows "the first time ever" on every process, since a
+    // process only runs once. An array rather than a bool per hint: these
+    // will not stay singular, and a list means adding one does not change the
+    // schema.
     [[nodiscard]] static bool hint_seen(std::string_view id);
 
     static void mark_hint_seen(std::string_view id);
@@ -592,6 +594,23 @@ public:
     // here would trade a crash for a silence.
     [[nodiscard]] static std::expected<void, std::string>
     record_client_version(const std::string& version);
+
+    // Which xlings last confirmed this home's registrations are readable in
+    // the format the running client expects.
+    //
+    // Distinct from `recorded_client_version`, which moves on every `self
+    // install`/upgrade whether or not anything was checked. This one moves
+    // only when `self doctor --fix` converges (see doctor.cpp's stamp site),
+    // so the gap between the two names exactly the home a migration nudge
+    // should still apply to: set up by a newer client than the last one that
+    // actually looked.
+    [[nodiscard]] static std::string recorded_verified_version();
+
+    // Same shape as `record_client_version`: read-modify-write of the single
+    // "verifiedBy" field, refusing to overwrite a document it cannot parse,
+    // and returning the write failure rather than throwing it.
+    [[nodiscard]] static std::expected<void, std::string>
+    record_verified_version(const std::string& version);
 
     // Save current subos workspace (project-local if project config exists)
     static void save_workspace();

@@ -183,6 +183,9 @@ TESTS=(
     # against 2026.9.4.1, where one --fix deleted 1173 sysroot links and
     # dropped 367 registrations with every payload present on disk.
     "E2E-99 |doctor_relocated_home_test.sh||"
+    # An upgrade is announced once per home, not once per command, and
+    # `self doctor --fix` stamps the verified version once it converges.
+    "E2E-100|notice_once_test.sh||"
 )
 
 # ── orphan check: a test that runs NOWHERE looks exactly like one that passes ──

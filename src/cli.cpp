@@ -12,6 +12,7 @@ import mcpplibs.cmdline;
 import mcpplibs.capi.lua;
 import mcpplibs.xpkg.executor;
 import xlings.core.config;
+import xlings.core.notice;
 import xlings.core.home_config;
 import xlings.libs.json;
 import xlings.core.log;
@@ -333,6 +334,40 @@ void show_interactive_hint_once_() {
         .summary = "xlings can ask instead of printing a list",
         .facts   = { { "keys", "up/down to move, enter to pick, esc to skip" } },
         .actions = { { "turn it off", "xlings config --interactive false" } },
+    });
+}
+
+// ─── Upgrade notice: told once per version, not once per command ───
+//
+// Four call sites used to print "run xlings self doctor --fix" on every
+// command whenever the home's recorded version differed from the running
+// one -- because none of them had cross-process memory. `notice::notice_once`
+// is the memory; this is the one caller that fires on an ordinary command
+// rather than from inside `self doctor`/`self update` (which report the same
+// fact as part of their own output, not as an interruption).
+//
+// TTY-gated for the same reason as `show_interactive_hint_once_`: a script
+// piping `xlings list` output must see only what it asked for. Excluded on
+// `self`/`interface`: `self doctor`/`self update` already say this as part of
+// their job, and `interface` is a machine's NDJSON stream.
+void show_upgrade_notice_once_() {
+    if (!platform::supports_rewrite_output()) return;
+
+    auto verified = Config::recorded_verified_version();
+    if (verified.empty()) verified = Config::recorded_client_version();
+    if (verified == Info::VERSION) return;
+
+    // An empty string is not "an earlier version" -- it is "nothing on
+    // record", a home from before either field existed. Still worth the one
+    // notice (the `self doctor` it points at is what stamps the record for
+    // good), just not worth a claim this code cannot back up.
+    const auto verifiedOrSetup = verified.empty()
+        ? std::string("an unrecorded version") : verified;
+    notice::notice_once("client.upgraded", Info::VERSION, {
+        .code    = "self.upgraded",
+        .summary = std::format("xlings is now {}; this home was last "
+                               "verified by {}", Info::VERSION, verifiedOrSetup),
+        .actions = { { "check the home", "xlings self doctor" } },
     });
 }
 
@@ -1360,6 +1395,15 @@ int dispatch_(int argc, char* argv[]) {
     for (int i = 1; i < fargc; ++i) {
         std::string_view a { fargv[i] };
         if (!a.starts_with("-")) { cmd = std::string(a); break; }
+    }
+
+    // Told once per version, not once per command -- see
+    // show_upgrade_notice_once_. `self`/`interface` are excluded: `self
+    // doctor`/`self update` report the same fact as part of their own job,
+    // and `interface` is a machine's NDJSON stream, not a person's terminal.
+    if (!cmd.empty() && cmd != "self" && cmd != "interface"
+        && cmd != "--version" && cmd != "-h") {
+        show_upgrade_notice_once_();
     }
 
     // Special: subos, self, script need raw argc/argv

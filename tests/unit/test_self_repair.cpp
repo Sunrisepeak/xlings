@@ -313,7 +313,10 @@ TEST(SelfRepairHint, AppearsOnlyWhenTheRecordedClientDiffers) {
     auto hint = migration_hint("v0.4.69", "2026.7.28.1");
     ASSERT_TRUE(hint.has_value());
     EXPECT_NE(hint->find("0.4.69"), std::string::npos);
-    EXPECT_NE(hint->find("xlings self doctor --fix"), std::string::npos);
+    EXPECT_NE(hint->find("2026.7.28.1"), std::string::npos);
+    // This is a fact for a doctor report, not a repeat of the command that
+    // report is already part of.
+    EXPECT_EQ(hint->find("--fix"), std::string::npos);
 }
 
 // After a successful --fix stamps the field, the hint has to stop. The `v`

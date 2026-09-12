@@ -4432,15 +4432,23 @@ void render_(const Scan& scan, const RepairReport& repair, bool fix,
         add("hint", "run `xlings self doctor --fix` to repair", true);
     }
 
-    // The nudge, for a home an older client set up. Last field of the same
-    // panel rather than a panel of its own: a second panel renders its own
-    // (empty) header, which reads as a broken frame rather than a footnote.
-    // Gated on the recorded version differing from the running one, which is
-    // what makes a successful `--fix` turn it off rather than merely quieten
-    // it.
-    if (auto hint = migration_hint(Config::recorded_client_version(),
-                                   Info::VERSION)) {
-        add(glyph::mark(glyph::note, "migration"), *hint);
+    // The nudge, for a home the running client has not yet verified. Last
+    // field of the same panel rather than a panel of its own: a second panel
+    // renders its own (empty) header, which reads as a broken frame rather
+    // than a footnote.
+    //
+    // Gated on `recorded_verified_version() != Info::VERSION`, not on
+    // `migration_hint`'s own comparison -- a home the running client has
+    // already verified has nothing to report here even if `migration_hint`
+    // would otherwise have something to say about the SETUP version, and a
+    // successful `--fix` stamping "verifiedBy" is what turns this field off.
+    if (auto verified = Config::recorded_verified_version();
+        verified != Info::VERSION) {
+        if (auto hint = migration_hint(
+                Config::recorded_client_version(),
+                verified.empty() ? std::string(Info::VERSION) : verified)) {
+            add(glyph::mark(glyph::note, "home"), *hint);
+        }
     }
 
     nlohmann::json payload;
@@ -4890,17 +4898,20 @@ int cmd_doctor(EventStream& stream, bool fix, bool resetMetadata, bool dryRun, b
 
     // Stamp the home with the client that just checked it.
     //
-    // `.xlings.json:version` records which xlings set the home up. Only `self
-    // install` ever wrote it, so `self update` -- which installs xlings@latest
-    // as a package -- left it reading the old version forever. Stamped here it
-    // becomes the migration marker: the hint appears while the home is behind
-    // and stops once a --fix has actually migrated the packages.
+    // `.xlings.json:verifiedBy` records which xlings last confirmed this
+    // home's registrations are readable in the running format -- distinct
+    // from `.xlings.json:version`, which `self install` moves on every
+    // upgrade whether or not anything was ever checked. Stamped here it
+    // becomes the migration marker: the hint appears while a home is ahead
+    // of its last verification and stops once a `--fix` has actually
+    // migrated the packages.
     //
-    // Gated on the repairs this pass OWNS, not on a spotless home. doctor also
-    // reports things --fix is not responsible for -- unresolvable aliases,
-    // shim anchoring, another subos's broken payload -- and requiring zero of
-    // those would mean the marker never lands and the hint nags forever about
-    // a migration that already happened.
+    // Gated on the repairs THIS PASS OWNS (`outstanding`), not on a spotless
+    // home: doctor also reports things `--fix` is not responsible for --
+    // unresolvable aliases, shim anchoring, another subos's broken payload --
+    // and requiring zero of those would mean the marker never lands and the
+    // hint nags forever about a migration that already happened. A foreign
+    // payload is one such finding, so it no longer gates the stamp either.
     //
     // A read-only home is a legitimate environment (a sandbox, a read-only
     // mount), and this used to be the one writer in the run that could not
@@ -4911,13 +4922,13 @@ int cmd_doctor(EventStream& stream, bool fix, bool resetMetadata, bool dryRun, b
     // since it was written; the two now share one fate, which includes being
     // stamped BEFORE the report, so a failure to stamp is a line IN it rather
     // than a stray one underneath.
-    if (outstanding == 0 && after.foreignPayloads == 0) {
-        if (auto stamped = Config::record_client_version(
+    if (outstanding == 0) {
+        if (auto stamped = Config::record_verified_version(
                 std::string(Info::VERSION));
             !stamped) {
             repair.notes.emplace_back(
                 glyph::mark(glyph::failed, "home stamp"),
-                std::format("could not record the client version in {}: {}",
+                std::format("could not record the verified version in {}: {}",
                             Config::display_path(
                                 Config::paths().homeDir / ".xlings.json"),
                             stamped.error()));

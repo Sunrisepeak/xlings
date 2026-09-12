@@ -1311,6 +1311,44 @@ Config::record_client_version(const std::string& version) {
     return {};
 }
 
+[[nodiscard]] std::string Config::recorded_verified_version() {
+    namespace fs = std::filesystem;
+    auto configPath = instance_().paths_.homeDir / ".xlings.json";
+    if (!fs::exists(configPath)) return {};
+    try {
+        auto content = platform::read_file_to_string(configPath.string());
+        auto json = nlohmann::json::parse(content, nullptr, false);
+        if (json.is_discarded() || !json.is_object()) return {};
+        auto it = json.find("verifiedBy");
+        if (it == json.end() || !it->is_string()) return {};
+        return it->get<std::string>();
+    } catch (...) { return {}; }
+}
+
+std::expected<void, std::string>
+Config::record_verified_version(const std::string& version) {
+    namespace fs = std::filesystem;
+    auto configPath = instance_().paths_.homeDir / ".xlings.json";
+    nlohmann::json json = nlohmann::json::object();
+    if (fs::exists(configPath)) {
+        try {
+            auto content = platform::read_file_to_string(configPath.string());
+            json = nlohmann::json::parse(content, nullptr, false);
+            // Same refusal as record_client_version: never replace a
+            // document we could not parse. Trading an unrecorded verification
+            // for a lost versions DB is not a trade.
+            if (json.is_discarded() || !json.is_object()) return {};
+        } catch (...) { return {}; }
+    }
+    json["verifiedBy"] = version;
+    try {
+        platform::write_string_to_file(configPath.string(), json.dump(2));
+    } catch (const std::exception& e) {
+        return std::unexpected(e.what());
+    }
+    return {};
+}
+
 void Config::mark_hint_seen(std::string_view id) {
     namespace fs = std::filesystem;
     auto configPath = instance_().paths_.homeDir / ".xlings.json";

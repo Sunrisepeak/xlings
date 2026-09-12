@@ -970,8 +970,6 @@ int cmd_use(const std::string& target, const std::string& version, EventStream& 
                   plan->toProvider);
     }
 
-    xself::print_migration_hint_once(Config::recorded_client_version(),
-                                     Info::VERSION);
     return 0;
 }
 
