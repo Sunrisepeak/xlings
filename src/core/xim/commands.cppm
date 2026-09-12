@@ -158,6 +158,31 @@ int cmd_install(std::span<const std::string> targets, bool yes, bool noDeps,
 // every subos that references the target. Any other value (`--subos NAME`)
 // acts on exactly that one subos, whether or not it currently has the
 // target.
+// One package that would still need `targetBare`, by name and version.
+struct Dependent { std::string name; std::string version; };
+
+// Direct dependents of `targetBare` (a BARE package name -- no namespace,
+// no version) among everything currently installed in the CURRENT subos.
+//
+// Shared by two callers that ask the identical question for opposite
+// reasons. `cmd_remove`'s own reverse-dependency guard asks it BEFORE
+// removing anything, to refuse and name them. The repair ladder's R3
+// (`self doctor --fix`, src/core/xself/repair.cpp) runs `remove --force`
+// -- deliberately bypassing that guard, the same way a human's `--force`
+// does -- and when the reinstall that was meant to follow then fails, the
+// package is gone for real and whatever named it as a dependency is now
+// broken with no diagnostic pointing back at this repair. Asking the same
+// question AFTER the fact, in that one outcome, is what lets the report
+// say so instead of leaving the next `ld.lld` failure to look unrelated.
+//
+// Only DIRECT dependents, and that is not a shortcut: a dependency's
+// libdirs enter a payload's RPATH closure only when it is named as a
+// direct dep (elfpatch's closure_lib_paths reads the direct list). A
+// package two hops away does not have this payload on any search path, so
+// removing it cannot break that package through the loader.
+std::vector<Dependent> direct_dependents_of(PackageCatalog& catalog,
+                                            std::string_view targetBare);
+
 std::expected<bool, std::string>
 selected_payloadless_config_has_uninstall_(
         PackageCatalog& catalog,

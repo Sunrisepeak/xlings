@@ -46,7 +46,7 @@ std::optional<std::string> migration_hint(std::string_view recorded,
     return std::format("set up by {}; last verified by {}", a, b);
 }
 
-RepairResult repair_one(const RepairTask& task, const RepairPolicy& policy, const CommandRunner& run, const RemovalVerifier& removalDone) {
+RepairResult repair_one(const RepairTask& task, const RepairPolicy& policy, const CommandRunner& run, const RemovalVerifier& removalDone, const DependentsProvider& dependentsOf) {
     const auto coordinate = task.coordinate.empty()
         ? std::format("{}@{}", task.target, task.version)
         : task.coordinate;
@@ -144,9 +144,12 @@ RepairResult repair_one(const RepairTask& task, const RepairPolicy& policy, cons
     // Removed for real, and could not be put back. The one outcome that leaves
     // the user worse off than before the repair, so it is never folded into a
     // generic failure: name it and hand back the command that finishes the job.
+    std::vector<Dependent> dependents;
+    if (dependentsOf) dependents = dependentsOf(task.target);
     return {false, "reinstall",
             std::format("REMOVED but could not reinstall — run "
-                        "`xlings install {}`", coordinate)};
+                        "`xlings install {}`", coordinate),
+            std::move(dependents)};
 }
 
 }

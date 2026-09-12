@@ -66,6 +66,12 @@ struct RepairPolicy {
     std::string client { "xlings" };
 };
 
+// One package that would still need the coordinate a repair just removed,
+// by name and version. Duplicated from xim::Dependent rather than imported:
+// this module has no catalog access by design (see RepairPolicy/CommandRunner
+// above), and a plain struct costs nothing to keep in step by hand.
+struct Dependent { std::string name; std::string version; };
+
 struct RepairResult {
     bool        healed { false };
     // Which rung did the work, for the report: "re-register" | "reinstall" |
@@ -73,6 +79,12 @@ struct RepairResult {
     // to be distinguishable in the output, and a bool cannot say which.
     std::string rung   { "none" };
     std::string note;
+    // Filled only for R3's terminal outcome (removed for real, could not be
+    // put back) when a DependentsProvider was supplied and it named at
+    // least one. Empty in every other case, including that same outcome
+    // with no provider -- a caller that does not ask does not get an
+    // answer, the same convention `removalDone` already sets.
+    std::vector<Dependent> dependents;
 };
 
 // Names reach us from the versions DB, which recipes write, and the commands
@@ -102,6 +114,24 @@ using CommandRunner = std::function<int(const std::string&)>;
 // behaviour, which is what the unit tests of the other rungs rely on.
 using RemovalVerifier =
     std::function<bool(const std::string& target, const std::string& version)>;
+
+// Who still needs `target` (a bare package/xvm-target name), among what is
+// installed right now.
+//
+// Asked only once, after R3's forced remove has already happened and the
+// reinstall meant to follow it has already failed -- i.e. only for the one
+// outcome ("REMOVED but could not reinstall") that leaves the user worse
+// off than before, the same gate `dependents` on RepairResult documents.
+// `remove --force` bypasses `cmd_remove`'s own reverse-dependency guard by
+// design (this rung already decided the removal has to happen); this is
+// what lets the report say what that bypass may have broken, instead of
+// leaving the next unrelated-looking loader failure to be debugged from
+// scratch. Injected for the same reason `RemovalVerifier` is: this module
+// has no catalog access, and a caller that supplies nothing gets the old
+// behaviour (no dependents reported) -- what the unit tests of every other
+// rung already rely on.
+using DependentsProvider =
+    std::function<std::vector<Dependent>(const std::string& target)>;
 
 // Silences a probe. The probe's output is not part of doctor's report and
 // would interleave with it.
@@ -161,6 +191,7 @@ std::optional<std::string> migration_hint(std::string_view recorded,
 RepairResult repair_one(const RepairTask& task,
                         const RepairPolicy& policy,
                         const CommandRunner& run,
-                        const RemovalVerifier& removalDone = nullptr);
+                        const RemovalVerifier& removalDone = nullptr,
+                        const DependentsProvider& dependentsOf = nullptr);
 
 } // namespace xlings::xself

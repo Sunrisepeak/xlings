@@ -917,6 +917,57 @@ selected_payloadless_config_has_uninstall_(
     return executor->has_hook(xpkg::HookType::Uninstall);
 }
 
+std::vector<Dependent> direct_dependents_of(PackageCatalog& catalog,
+                                            std::string_view targetBare) {
+    std::vector<Dependent> dependents;
+    const auto platform = detect_platform();
+    const auto bare_of = [](const std::string& s) {
+        auto noVer = s.substr(0, s.find('@'));
+        return noVer.substr(noVer.rfind(':') + 1);
+    };
+
+    // Current subos only. A package installed in another subos resolves
+    // through that subos's own payloads; removing THIS target here detaches
+    // rather than deletes, which is exactly the case that must not be
+    // reported as breaking anything.
+    for (const auto& rec : collect_inventory(catalog, /*allSubos=*/false)) {
+        // By bare name: the same package can be installed under two
+        // namespaces, and neither of them is "not the target".
+        if (bare_of(rec.canonicalName) == targetBare) continue;
+
+        auto depMatch = catalog.resolve_target(
+            rec.canonicalName + "@" + rec.version, platform);
+        if (!depMatch) continue;
+        auto depPkg = catalog.load_package(*depMatch);
+        if (!depPkg) continue;
+
+        // runtime first, falling back to the legacy union `deps` — the same
+        // precedence `info` uses. Build deps are irrelevant here: they are
+        // not on the consumer's runtime search path.
+        const std::vector<std::string>* list = nullptr;
+        if (auto it = depPkg->xpm.runtime_deps.find(platform);
+            it != depPkg->xpm.runtime_deps.end() && !it->second.empty()) {
+            list = &it->second;
+        } else if (auto it2 = depPkg->xpm.deps.find(platform);
+                   it2 != depPkg->xpm.deps.end() && !it2->second.empty()) {
+            list = &it2->second;
+        }
+        if (!list) continue;
+
+        for (const auto& dep : *list) {
+            // "xim:zlib@1.3.1" -> "zlib". Compare bare names: the namespace
+            // a consumer writes is not always the one the target resolved
+            // under, and a version range must not make a real dependency
+            // invisible to this check.
+            if (bare_of(dep) == targetBare) {
+                dependents.push_back({rec.canonicalName, rec.version});
+                break;
+            }
+        }
+    }
+    return dependents;
+}
+
 // One target string ("name", "name@version", "ns:name@version"), resolved
 // and removed from whatever subos Config's active-subos override currently
 // points at. Everything from the self-binary guard through the uninstall
@@ -962,7 +1013,25 @@ int cmd_remove_resolved_(const std::string& target,
         if (!match->installed && !payloadlessUninstallProven) {
             bool hasDbRecord = false;
             if (auto at = resolveTarget.find('@'); at != std::string::npos) {
-                auto bareTargetName = target.substr(target.rfind(':') + 1);
+                // Strip the VERSION first, from `resolveTarget` (the
+                // concrete coordinate this call resolved to), then the
+                // namespace -- the same order stripVer/bare_of use
+                // elsewhere in this file. The old code stripped only the
+                // namespace, and did it from `target` (the argument as
+                // typed) rather than `resolveTarget`: for a bare `remove
+                // <name>` that string never had a namespace to strip, so
+                // the bug was invisible there, but the repair ladder (and
+                // anyone else calling `remove ns:name@version` directly)
+                // always passes the full coordinate. Looking up
+                // "unfixable@1.0.0" as a TARGET NAME in a DB keyed by the
+                // bare "unfixable" always misses -- `hasDbRecord` came
+                // back false for a record that plainly existed, and a
+                // BrokenPayload repair's `remove --force` silently no-op'd
+                // on exactly the payload-already-gone case it exists to
+                // clean up (2026.9.12, found while building F1's e2e).
+                auto bareBeforeVersion = resolveTarget.substr(0, at);
+                auto bareTargetName =
+                    bareBeforeVersion.substr(bareBeforeVersion.rfind(':') + 1);
                 auto version = resolveTarget.substr(at + 1);
                 hasDbRecord = xvm::has_version(Config::versions(), bareTargetName, version);
             }
@@ -1035,10 +1104,6 @@ int cmd_remove_resolved_(const std::string& target,
     // clean pass. Take the bare name the way the subos-membership check above
     // already does, and check regardless.
     if (!force) {
-        struct Dependent { std::string name; std::string version; };
-        std::vector<Dependent> dependents;
-
-        const auto platform = detect_platform();
         const auto bare_of = [](const std::string& s) {
             auto noVer = s.substr(0, s.find('@'));
             return noVer.substr(noVer.rfind(':') + 1);
@@ -1046,44 +1111,7 @@ int cmd_remove_resolved_(const std::string& target,
         const auto targetBare =
             match ? bare_of(match->canonicalName) : bare_of(target);
 
-        // Current subos only. A package installed in another subos resolves
-        // through that subos's own payloads; removing it here detaches rather
-        // than deletes, which is exactly the case that must NOT be blocked.
-        for (const auto& rec : collect_inventory(catalog, /*allSubos=*/false)) {
-            // By bare name: the same package can be installed under two
-            // namespaces, and neither of them is "not the target".
-            if (bare_of(rec.canonicalName) == targetBare) continue;
-
-            auto depMatch = catalog.resolve_target(
-                rec.canonicalName + "@" + rec.version, platform);
-            if (!depMatch) continue;
-            auto depPkg = catalog.load_package(*depMatch);
-            if (!depPkg) continue;
-
-            // runtime first, falling back to the legacy union `deps` — the
-            // same precedence `info` uses. Build deps are irrelevant here:
-            // they are not on the consumer's runtime search path.
-            const std::vector<std::string>* list = nullptr;
-            if (auto it = depPkg->xpm.runtime_deps.find(platform);
-                it != depPkg->xpm.runtime_deps.end() && !it->second.empty()) {
-                list = &it->second;
-            } else if (auto it2 = depPkg->xpm.deps.find(platform);
-                       it2 != depPkg->xpm.deps.end() && !it2->second.empty()) {
-                list = &it2->second;
-            }
-            if (!list) continue;
-
-            for (const auto& dep : *list) {
-                // "xim:zlib@1.3.1" -> "zlib". Compare bare names: the
-                // namespace a consumer writes is not always the one the
-                // target resolved under, and a version range must not make
-                // a real dependency invisible to this check.
-                if (bare_of(dep) == targetBare) {
-                    dependents.push_back({rec.canonicalName, rec.version});
-                    break;
-                }
-            }
-        }
+        auto dependents = direct_dependents_of(catalog, targetBare);
 
         if (!dependents.empty()) {
             log::error("{}@{} is required by {} installed package(s) in subos '{}':",
