@@ -216,10 +216,12 @@ PY
 
 log "Injection 3: a local overlay recipe whose file is deleted after add-xpkg"
 mkdir -p "$RUNTIME_DIR/local-src"
-cat > "$RUNTIME_DIR/local-src/isolocal.lua" <<'LUA'
+emit_overlay_src() {
+  local name="$1"
+  cat > "$RUNTIME_DIR/local-src/$name.lua" <<LUA
 package = {
     spec = "1",
-    name = "isolocal",
+    name = "$name",
     description = "Local-only overlay fixture, never installed, for tests/e2e/broken_home_isolation_test.sh",
     authors = {"xlings-ci"},
     licenses = {"MIT"},
@@ -234,12 +236,24 @@ package = {
     },
 }
 LUA
+}
+emit_overlay_src isolocal
+# A SECOND, untouched overlay entry -- proves the blast radius of the
+# deleted-file entry below is itself just one entry, not the whole overlay
+# listing.
+emit_overlay_src isolocalhealthy
+
 addout="$(RUN config --add-xpkg "$RUNTIME_DIR/local-src/isolocal.lua" 2>&1)" \
-  || fail "setup: config --add-xpkg failed:
+  || fail "setup: config --add-xpkg isolocal failed:
 $addout"
 OVERLAY_FILE="$HOME_DIR/data/xim-pkgindex-local/pkgs/i/isolocal.lua"
 [[ -f "$OVERLAY_FILE" ]] || fail "setup: overlay file should exist at $OVERLAY_FILE:
 $addout"
+
+addout2="$(RUN config --add-xpkg "$RUNTIME_DIR/local-src/isolocalhealthy.lua" 2>&1)" \
+  || fail "setup: config --add-xpkg isolocalhealthy failed:
+$addout2"
+
 rm -f "$OVERLAY_FILE"
 [[ ! -e "$OVERLAY_FILE" ]] || fail "setup: overlay file should be gone"
 
@@ -297,6 +311,28 @@ $list_all_out"
 echo "$list_all_out" | strip_ansi | grep -q "broken" \
   || fail "list --all: expected the unreadable subos's name ('broken') in the note; got:
 $list_all_out"
+
+# This is what actually exercises injection 3: `.overlay.json` still has a
+# TRACKED entry for isolocal (added by config --add-xpkg above), but the
+# recipe FILE it points at is gone. Nothing else in this test ever reads
+# the local overlay's provenance -- the catalog's normal package scan globs
+# pkgs/*/*.lua directly and simply never sees a file that isn't there, so
+# without this call injection 3 would be pure setup, asserted on by
+# nothing. `config --list-xpkg` is the one command that reads
+# `.overlay.json` against disk (`load_with_files` + `status_of` per entry)
+# and is exactly where a tracked-but-deleted file could crash the whole
+# listing instead of just that one row.
+log "config --list-xpkg (the deleted overlay file must not crash the listing)"
+rc=0; listxpkg_out="$(RUN config --list-xpkg 2>&1)" || rc=$?
+assert_survives "config --list-xpkg" "$rc" "$listxpkg_out"
+# Not asserting what it says about the deleted entry itself (whatever
+# status label that renders as is an implementation detail) -- only that
+# the healthy, untouched sibling entry still shows up, i.e. the deleted
+# file took down its own row and nothing else.
+echo "$listxpkg_out" | strip_ansi | grep -q "isolocalhealthy" \
+  || fail "config --list-xpkg: expected the untouched sibling overlay entry
+('isolocalhealthy') to still be listed even though isolocal's file is gone; got:
+$listxpkg_out"
 
 snap_after="$(snapshot)"
 [[ "$snap_after" == "$snap_before" ]] \

@@ -169,15 +169,16 @@ std::vector<SubosSnapshot> load_subos_snapshots(const fs::path& xlingsHome,
         auto wsPath = entry.path() / ".xlings.json";
         std::error_code fec;
         if (!fs::exists(wsPath, fec)) continue;
+        auto mark_unreadable = [&] { if (unreadable) unreadable->push_back(name); };
         try {
             auto content = platform::read_file_to_string(wsPath.string());
             auto json = nlohmann::json::parse(content, nullptr, false);
             if (json.is_discarded() || !json.is_object()) {
-                if (unreadable) unreadable->push_back(name);
+                mark_unreadable();
                 continue;
             }
             if (!json.contains("workspace") || !json["workspace"].is_object()) {
-                if (unreadable) unreadable->push_back(name);
+                mark_unreadable();
                 continue;
             }
             snapshots.push_back({
@@ -186,7 +187,7 @@ std::vector<SubosSnapshot> load_subos_snapshots(const fs::path& xlingsHome,
                 .workspace = xvm::subos_workspace_from_json(json["workspace"]),
             });
         } catch (...) {
-            if (unreadable) unreadable->push_back(name);
+            mark_unreadable();
         }
     }
     std::ranges::sort(snapshots, [](const auto& a, const auto& b) {
