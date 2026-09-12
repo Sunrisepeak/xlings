@@ -21,6 +21,10 @@
 #       removal (detach-only instead), names the subos, and is NOT
 #       overridden by `--force`; fixing the file lets removal proceed
 #       (2026.9.12, Item A)
+#   S9  the target is absent in this subos, present in exactly one other:
+#       without `-y`, `remove` stays here and offers `--all-subos`; with
+#       `-y` and no explicit `--subos`/`--all-subos`, it implicitly reaches
+#       the subos that actually has it (2026.9.12, F5)
 #
 # Every scenario ends with assert_gone, which checks all four places state
 # can hide: the version DB, every subos workspace, every subos's program
@@ -251,6 +255,29 @@ rm -rf "${PLAIN_STORE:?}/1.0.0"
 RUN remove plain -y >"$RUNTIME_DIR/s4.out" 2>&1 \
   || { sed 's/^/    | /' "$RUNTIME_DIR/s4.out" >&2; fail "S4: remove should exit 0"; }
 assert_gone plain 1.0.0 "S4"
+
+# ── S4b: the SAME shape, targeted by its full "ns:name@version" coordinate
+#         (2026.9.12, found building F1's e2e) ────────────────────────────
+#
+# `cmd_remove_resolved_`'s DB-record fallback (the one S4 above exercises)
+# derived its "is there still a record for this" check from `target`
+# stripping only a namespace, never a version -- so a bare `remove plain`
+# happened to work (that argument never HAD a version to leave attached),
+# while the repair ladder's own commands (repair.cpp always passes the
+# full "ns:name@version" coordinate) looked up a DB target literally named
+# "plain@1.0.0", found nothing, and treated a genuinely broken-but-
+# registered package as "not installed" -- a silent no-op on `remove
+# --force`, the one rung whose whole job is cleaning up exactly this case.
+log "S4b: remove <ns>:<name>@<version> --force -y after the payload is gone"
+RUN install plain@1.0.0 -y >/dev/null 2>&1 || fail "S4b setup: install failed"
+PLAIN_STORE4B="$(find "$HOME_DIR/data/xpkgs" -maxdepth 1 -type d -name '*-x-plain' | head -1)"
+[[ -n "$PLAIN_STORE4B" ]] || fail "S4b setup: could not find plain's store dir"
+rm -rf "${PLAIN_STORE4B:?}/1.0.0"
+RUN remove xim:plain@1.0.0 --force -y >"$RUNTIME_DIR/s4b.out" 2>&1 \
+  || { sed 's/^/    | /' "$RUNTIME_DIR/s4b.out" >&2; fail "S4b: remove should exit 0"; }
+assert_contains "$(cat "$RUNTIME_DIR/s4b.out")" "removed" \
+  "S4b: expected a real removal, not a silent 'is not installed' no-op"
+assert_gone plain 1.0.0 "S4b"
 log "  PASS: a payload deleted out from under the DB does not block removal"
 
 # ── S5: #578 -- a DB record with no active workspace binding ──────────────
@@ -304,11 +331,21 @@ log "  PASS: --all cleared every version"
 # other subos.
 log "S8: unreadable sibling subos blocks a full removal, --force does not override it"
 RUN subos new other2 >/dev/null 2>&1 || fail "S8 setup: subos new other2 failed"
+RUN subos new other3 >/dev/null 2>&1 || fail "S8 setup: subos new other3 failed"
 RUN_IN default install plain@1.0.0 -y >/dev/null 2>&1 || fail "S8 setup: default install failed"
 RUN_IN other2  install plain@1.0.0 -y >/dev/null 2>&1 || fail "S8 setup: other2 install failed"
+RUN_IN other3  install plain@1.0.0 -y >/dev/null 2>&1 || fail "S8 setup: other3 install failed"
 WS_OTHER2="$HOME_DIR/subos/other2/.xlings.json"
+WS_OTHER3="$HOME_DIR/subos/other3/.xlings.json"
 cp "$WS_OTHER2" "$RUNTIME_DIR/other2-ws.bak"
+cp "$WS_OTHER3" "$RUNTIME_DIR/other3-ws.bak"
+# TWO corrupted siblings, deliberately -- F9 (2026.9.12): the scan used to
+# stop at the FIRST unreadable subos it found and warn about only that one,
+# while the separate pinned_by report (S8's own #578-era neighbour) already
+# listed every unreadable subos it saw. This proves the decision-time
+# warning now names ALL of them too, not just whichever sorted first.
 printf '{garbage' > "$WS_OTHER2"
+printf '{garbage' > "$WS_OTHER3"
 
 PLAIN_STORE8="$(find "$HOME_DIR/data/xpkgs" -maxdepth 1 -type d -name '*-x-plain' | head -1)"
 [[ -n "$PLAIN_STORE8" ]] || fail "S8 setup: could not find plain's store dir"
@@ -318,7 +355,9 @@ RUN_IN default remove plain -y >"$RUNTIME_DIR/s8a.out" 2>&1 \
 [[ -d "$PLAIN_STORE8/1.0.0" ]] \
   || fail "S8a: payload must still be on disk -- an unreadable subos might still use it"
 assert_contains "$(cat "$RUNTIME_DIR/s8a.out")" "other2" \
-  "S8a: stderr must name the unreadable subos"
+  "S8a: stderr must name the first unreadable subos"
+assert_contains "$(cat "$RUNTIME_DIR/s8a.out")" "other3" \
+  "S8a: stderr must name the SECOND unreadable subos too, not just the first one found"
 
 RUN_IN default remove plain --force -y >"$RUNTIME_DIR/s8b.out" 2>&1 \
   || { sed 's/^/    | /' "$RUNTIME_DIR/s8b.out" >&2; fail "S8b: remove --force should exit 0 (still detach-only)"; }
@@ -328,10 +367,64 @@ assert_contains "$(cat "$RUNTIME_DIR/s8b.out")" "does not override" \
   "S8b: stderr must say --force does not override this"
 
 cp "$RUNTIME_DIR/other2-ws.bak" "$WS_OTHER2"
+cp "$RUNTIME_DIR/other3-ws.bak" "$WS_OTHER3"
 RUN_IN other2 remove plain -y >"$RUNTIME_DIR/s8c.out" 2>&1 \
   || { sed 's/^/    | /' "$RUNTIME_DIR/s8c.out" >&2; fail "S8c: remove in other2 (fixed) should exit 0"; }
-assert_gone plain 1.0.0 "S8c"
+# other3 still has plain@1.0.0 active/installed -- the payload must survive
+# this one, exactly like the still-unreadable case above did, just for an
+# ordinary reason now (a real, readable claimant) rather than an unreadable
+# one.
+[[ -d "$PLAIN_STORE8/1.0.0" ]] \
+  || fail "S8c: payload must still be on disk -- other3 (now readable) still uses it"
+RUN_IN other3 remove plain -y >"$RUNTIME_DIR/s8d.out" 2>&1 \
+  || { sed 's/^/    | /' "$RUNTIME_DIR/s8d.out" >&2; fail "S8d: remove in other3 should exit 0"; }
+assert_gone plain 1.0.0 "S8d"
 log "  PASS: an unreadable subos is treated as a user of the payload, and --force does not override that"
+
+# ── S9: implicit `-y` cross-subos expansion (cmd_remove's `!subosScope`
+#        branch, 2026.9.12 F5) ────────────────────────────────────────────
+#
+# The package is absent in `default` and present only in `other`. Without
+# `-y`, `remove` stays on `default` (the membership guard's ordinary
+# "not installed here" diagnostic, S1's neighbour). WITH `-y` and no
+# explicit `--subos`/`--all-subos`, `cmd_remove` itself expands to every
+# OTHER subos that actually references the target -- the user already said
+# yes to whatever happens, and there is nothing to remove on `default`
+# to ask about.
+log "S9: implicit -y cross-subos expansion of remove"
+RUN subos new other9 >/dev/null 2>&1 || fail "S9 setup: subos new other9 failed"
+RUN_IN other9 install plain@1.0.0 -y >/dev/null 2>&1 \
+  || fail "S9 setup: other9 install failed"
+
+log "S9a: remove plain (no -y) from default -> stays put, names other9, offers --all-subos"
+set +e
+OUT9A="$(RUN_IN default remove plain 2>&1)"; RC9A=$?
+set -e
+printf '%s\n' "$OUT9A" | sed 's/^/    | /'
+[[ "$RC9A" -eq 0 ]] || fail "S9a: expected exit 0 (nothing to remove here), got $RC9A"
+assert_contains "$OUT9A" "other9" \
+  "S9a: the message must name the subos that actually has it"
+# Not "--all-subos" alone: assert_contains's grep -F treats a needle
+# starting with "--" as an option flag, not a pattern. "remove plain
+# --all-subos" is the actual printed action line and starts with a letter.
+assert_contains "$OUT9A" "remove plain --all-subos" \
+  "S9a: the message must offer --all-subos as the way to remove it there"
+python3 - "$HOME_DIR/.xlings.json" <<'PY' \
+  || fail "S9a: plain@1.0.0 must still be in the version DB -- nothing should have been removed"
+import json, pathlib, sys
+data = json.loads(pathlib.Path(sys.argv[1]).read_text())
+versions = ((data.get("versions") or {}).get("plain", {}) or {}).get("versions", {})
+assert "1.0.0" in versions, versions
+PY
+log "  PASS: no -y stays on default and points at --all-subos"
+
+log "S9b: remove plain -y from default -> implicitly removed from other9"
+RUN_IN default remove plain -y >"$RUNTIME_DIR/s9b.out" 2>&1 \
+  || { sed 's/^/    | /' "$RUNTIME_DIR/s9b.out" >&2; fail "S9b: remove plain -y should exit 0"; }
+assert_contains "$(cat "$RUNTIME_DIR/s9b.out")" "other9" \
+  "S9b: the run should say which subos it acted in"
+assert_gone plain 1.0.0 "S9b"
+log "  PASS: -y with no explicit scope reached the subos that actually had it"
 
 # ── S3: the recipe has left the index entirely -- run last, it deletes it ──
 log "S3: recipe removed from the index, then remove --force"
@@ -345,4 +438,4 @@ assert_contains "$(cat "$RUNTIME_DIR/s3.out")" "no index provides" \
 assert_gone plain 1.0.0 "S3"
 log "  PASS: a version record survives its recipe, and --force can still clear it"
 
-log "PASS: remove --force / --all / --all-subos contract (S1-S8)"
+log "PASS: remove --force / --all / --all-subos contract (S1-S9)"
