@@ -1392,8 +1392,11 @@ Scan detect_(const DoctorState& st, const CoordinateProbe& probe,
             .remedy    = std::move(remedy),
             .groupKey  = std::format("{}|{}", expanded.string(), version),
             .active    = activeHere,
-            .unclaimed = !owner.ownedHere && owner.otherSubos.empty()
-                       && !activeHere,
+            // `owner.ownedHere` is `subos_claims`'s OR of "active here" and
+            // "in installed[] here" -- its first branch IS `activeHere`
+            // verbatim, so `!owner.ownedHere` already implies `!activeHere`.
+            // No separate term needed.
+            .unclaimed = !owner.ownedHere && owner.otherSubos.empty(),
         });
     };
 
@@ -3130,6 +3133,75 @@ void repair_other_subos_(const DoctorState& st, RepairReport& out) {
             out.notes.emplace_back(glyph::mark(glyph::bullet, "other subos repaired"), std::format(
                 "{}: dropped stale installed entry {}", live.subos,
                 xvm::display_coordinate(target, version)));
+        }
+    }
+}
+
+// A ForeignPayload or OtherSubos finding names a real defect, but repairing
+// it means running `xlings install`/`use` against a DIFFERENT subos's
+// workspace -- which this process cannot do while it is anchored to the one
+// it started in (see the `--subos` override at the top of cmd_doctor).
+// Walking every such subos in its own subprocess is how a plain `--fix`
+// reaches them without first making the user run `xlings subos use <name>
+// && xlings self doctor --fix` by hand -- the remedy 38 findings carried on
+// a measured home.
+//
+// The caller is responsible for not calling this from a process already
+// anchored via `--subos`: a child invoked WITH --subos must not walk again,
+// or two subprocesses would race to repair each other's findings (and,
+// unguarded, never terminate).
+void repair_other_subos_walk_(const Scan& scan, const std::string& client,
+                              bool dryRun, const CommandRunner& run,
+                              RepairReport& out,
+                              const std::function<void(std::string_view)>& onStep = {}) {
+    std::set<std::string> owners;
+    for (const auto& f : scan.findings) {
+        if ((f.kind == FindingKind::ForeignPayload
+             || f.kind == FindingKind::OtherSubos)
+            && !f.subos.empty()) {
+            owners.insert(f.subos.front());
+        }
+    }
+    for (const auto& name : owners) {
+        // Same guard every other shelled-out value in this file gets
+        // (client/target/version). A name that fails it is never executed
+        // -- reported as a failed subos instead, with a hand-run remedy, so
+        // it still gates the exit code and the stamp rather than silently
+        // dropping out of the walk. `is_shell_safe_token` refuses a leading
+        // '-' too, which is also exactly what would make the CHILD's own
+        // `--subos <value>` parser read the name as another flag and fail
+        // in some other, more confusing way -- one check covers both.
+        if (!is_shell_safe_token(name)) {
+            out.failedSubos.emplace_back(name, -1);
+            out.notes.emplace_back(
+                glyph::mark(glyph::failed, "cross-subos repair skipped"),
+                std::format(
+                    "subos '{}' — name is not a safe shell token; run "
+                    "`xlings subos use {} && xlings self doctor --fix` by "
+                    "hand", name, name));
+            continue;
+        }
+        const auto cmd = std::format(
+            "{} self doctor --fix --subos {}{}", client, name,
+            dryRun ? " --dry-run" : "");
+        if (dryRun) {
+            out.planned.push_back(std::format("would run {}", cmd));
+            continue;
+        }
+        if (onStep) onStep(std::format(
+            "repairing subos {} — running `{}`", name, cmd));
+        const int rc = run(cmd + quiet_suffix());
+        if (rc != 0) {
+            out.failedSubos.emplace_back(name, rc);
+            out.notes.emplace_back(
+                glyph::mark(glyph::failed, "cross-subos repair"),
+                std::format("subos '{}' — `{}` exited {}; run it directly "
+                            "to see why", name, cmd, rc));
+        } else {
+            out.notes.emplace_back(
+                glyph::mark(glyph::bullet, "other subos repaired"),
+                std::format("subos '{}' repaired via `self doctor --fix "
+                            "--subos {}`", name, name));
         }
     }
 }
@@ -4872,54 +4944,11 @@ int cmd_doctor(EventStream& stream, bool fix, bool resetMetadata, bool dryRun, b
         return platform::exec(cmd);
     };
 
-    // A ForeignPayload or OtherSubos finding names a real defect, but
-    // repairing it means running `xlings install`/`use` against a DIFFERENT
-    // subos's workspace -- which this process cannot do while it is anchored
-    // to the one it started in (see the `--subos` override at the top of
-    // this function). Walking every such subos in its own subprocess is how
-    // a plain `--fix` reaches them without first making the user run
-    // `xlings subos use <name> && xlings self doctor --fix` by hand -- the
-    // remedy 38 findings carried on a measured home.
-    //
-    // Guarded by `!subos`: a child invoked WITH --subos is already anchored
-    // to one subos and must not walk again, or two subprocesses would race
-    // to repair each other's findings (and, unguarded, never terminate).
-    const auto walk_other_subos = [&] {
-        if (subos) return;
-        std::set<std::string> owners;
-        for (const auto& f : scan.findings) {
-            if ((f.kind == FindingKind::ForeignPayload
-                 || f.kind == FindingKind::OtherSubos)
-                && !f.subos.empty()) {
-                owners.insert(f.subos.front());
-            }
-        }
-        for (const auto& name : owners) {
-            const auto cmd = std::format(
-                "{} self doctor --fix --subos {}{}", client, name,
-                dryRun ? " --dry-run" : "");
-            if (dryRun) {
-                repair.planned.push_back(std::format("would run {}", cmd));
-                continue;
-            }
-            stream.emit(LogEvent{
-                LogLevel::info,
-                std::format("repairing subos {} — running `{}`", name, cmd),
-            });
-            std::cout.flush();
-            const int rc = run(cmd + quiet_suffix());
-            if (rc != 0) {
-                repair.notes.emplace_back(
-                    glyph::mark(glyph::failed, "cross-subos repair"),
-                    std::format("subos '{}' — `{}` exited {}", name, cmd, rc));
-            } else {
-                repair.notes.emplace_back(
-                    glyph::mark(glyph::bullet, "other subos repaired"),
-                    std::format("subos '{}' repaired via `self doctor --fix "
-                                "--subos {}`", name, name));
-            }
-        }
-    };
+    // Guarded here, not inside repair_other_subos_walk_: a child invoked
+    // WITH --subos is already anchored to one subos and must not walk
+    // again, or two subprocesses would race to repair each other's findings
+    // (and, unguarded, never terminate).
+    const bool alreadyAnchored = subos.has_value();
 
     if (dryRun) {
         repair_relocation_(state, /*dryRun=*/true, repair);
@@ -4927,7 +4956,10 @@ int cmd_doctor(EventStream& stream, bool fix, bool resetMetadata, bool dryRun, b
         repair_payloads_(state, scan, probe, /*dryRun=*/true, repair);
         repair_incomplete_(scan, run, /*dryRun=*/true, repair);
         repair_inactive_(scan, client, run, /*dryRun=*/true, repair);
-        walk_other_subos();
+        if (!alreadyAnchored) {
+            repair_other_subos_walk_(scan, client, /*dryRun=*/true, run,
+                                     repair);
+        }
         render_(scan, repair, fix, dryRun, showOk, stream);
             return count_(scan).issues() == 0 ? 0 : 1;
     }
@@ -4990,9 +5022,13 @@ int cmd_doctor(EventStream& stream, bool fix, bool resetMetadata, bool dryRun, b
     repair_payloads_(state, scan, probe, /*dryRun=*/false, repair, announce);
     refresh();
 
-    // Phase 2.5: subos this run does not own. See walk_other_subos above for
-    // why this has to be a subprocess per subos and why `--subos` disarms it.
-    walk_other_subos();
+    // Phase 2.5: subos this run does not own. See repair_other_subos_walk_
+    // for why this has to be a subprocess per subos and why `--subos`
+    // disarms it (alreadyAnchored, computed before the dry-run branch above).
+    if (!alreadyAnchored) {
+        repair_other_subos_walk_(scan, client, /*dryRun=*/false, run, repair,
+                                 announce);
+    }
     refresh();
 
     // Phase 2b: payloads whose own stamp records a failed install.
@@ -5105,6 +5141,15 @@ int cmd_doctor(EventStream& stream, bool fix, bool resetMetadata, bool dryRun, b
     for (const auto& entry : repair.failedEntries) {
         if (stillFound.contains(entry)) ++outstanding;
     }
+    // A failed cross-subos child (repair_other_subos_walk_) is outstanding
+    // work unconditionally -- unlike failedEntries it has no (target,
+    // version) to look up in `stillFound`: the child exited already
+    // anchored to a subos THIS process never re-detects, so there is
+    // nothing here to re-check it against. Its mere presence in the list
+    // means that subos was not repaired, full stop, and it must gate the
+    // stamp and the exit code exactly like an outstanding failedEntries
+    // victim does.
+    outstanding += static_cast<int>(repair.failedSubos.size());
 
     // Stamp the home with the client that just checked it.
     //

@@ -18,6 +18,11 @@
 #       its payload is gone -- is pruned by `--fix --dry-run`, not queued
 #       for reinstall (D2): the plan says `prune`, never `would run ...
 #       install` for that entry.
+#   I5  a cross-subos child that genuinely FAILS (`self doctor --fix
+#       --subos <name>` exits non-zero) must be visible in the PARENT's
+#       verdict, not swallowed as a note nobody's exit code reflects: the
+#       parent exits 1, `verifiedBy` is not written, and the report names
+#       the failed subos and the exact command to re-run it directly.
 set -euo pipefail
 
 # shellcheck source=./project_test_lib.sh
@@ -29,7 +34,7 @@ RUNTIME_DIR="$ROOT_DIR/tests/e2e/runtime/doctor_cross_subos_fix"
 HOME_DIR="$RUNTIME_DIR/home"
 LOCAL_INDEX_DIR="$RUNTIME_DIR/xim-pkgindex"
 
-cleanup() { rm -rf "$RUNTIME_DIR"; }
+cleanup() { chmod -R u+w "$RUNTIME_DIR" 2>/dev/null || true; rm -rf "$RUNTIME_DIR"; }
 trap cleanup EXIT
 cleanup
 
@@ -174,5 +179,81 @@ grep -q "prune xsf-plain@9\.9\.9" <<<"$out" \
   || fail "I9: the plan must prune the unclaimed entry; got:\n$out"
 grep -qE "would run .*install xsf-plain@9\.9\.9" <<<"$out" \
   && fail "I9: the unclaimed entry must not be queued for reinstall; got:\n$out"
+
+# ── I5: a genuinely FAILING cross-subos child fails the whole run ────────
+#
+# Its own home, separate from I3/I9's -- this scenario is designed to end
+# with 'other' still broken (the child never gets a chance to succeed), and
+# must not leave that behind for the scenarios above to trip over.
+#
+# 'other's subos directory is made read-only, so when `default`'s --fix
+# shells into it (`self doctor --fix --subos other`), that child's own
+# reinstall of xsf-plain can create the payload file (install() writes
+# under data/, untouched by the read-only directory) but cannot write its
+# own workspace to register it (config()'s `xvm.add` targets
+# subos/other/.xlings.json) -- so the child's `xlings install` genuinely
+# fails (non-zero), not "succeeds but didn't really fix it": a real,
+# observable subprocess failure the child's own re-detect still finds
+# broken afterward, which is what makes this deterministic rather than a
+# race against however fast some prune or ladder rung reacts.
+#
+# Two mechanisms were tried and rejected before this one: a recipe absent
+# from the index (or present only for another platform) makes
+# owning_coordinate_ return no remedy, which repair_payloads_ prunes
+# unconditionally regardless of subos ownership -- converges cleanly, no
+# failure to observe. A recipe whose install() hook always returns false
+# DOES make `xlings install` exit non-zero, but the installer tags that
+# payload's `.xpkg-install.json` `incomplete: true`, which reclassifies the
+# finding from BrokenPayload to IncompletePayload on re-detect --
+# `stillFound` (below, and the pre-existing analogous check inside the
+# CHILD's own cmd_doctor) only looks at BrokenPayload/ForeignPayload, so the
+# child's OWN outstanding count comes out 0 and it stamps verifiedBy anyway
+# despite returning 1. That is a real, separate gap (IncompletePayload does
+# not gate `outstanding`), not something this scenario is testing -- if this
+# mechanism ever needs to change, keep re-detection landing on BrokenPayload,
+# not IncompletePayload, or this assertion block will need it fixed first.
+log "I5: a failing cross-subos child fails the whole run and withholds the stamp"
+HOME5="$RUNTIME_DIR/i5-home"
+mkdir -p "$HOME5/subos/default/bin"
+cp "$XLINGS_BIN" "$HOME5/xlings"
+cat > "$HOME5/.xlings.json" <<JSON
+{ "mirror": "GLOBAL",
+  "index_repos": [{ "name": "xim", "url": "$LOCAL_INDEX_DIR" }] }
+JSON
+RUN5() {
+  local subos="$1"; shift
+  ( cd /tmp && env -i HOME="$HOME" PATH=/usr/bin:/bin \
+      XLINGS_HOME="$HOME5" XLINGS_ACTIVE_SUBOS="$subos" \
+      "$XLINGS_BIN" "$@" )
+}
+RUN5 default self init >/dev/null 2>&1 || fail "I5 setup: self init failed"
+mkdir -p "$HOME5/data/xim-index-repos"
+printf '{}\n' > "$HOME5/data/xim-index-repos/xim-indexrepos.json"
+RUN5 default subos new other >/dev/null 2>&1 || fail "I5 setup: subos new other failed"
+RUN5 other install xsf-plain@1.0.0 -y >/dev/null 2>&1 \
+  || fail "I5 setup: other install xsf-plain failed"
+
+PAYLOAD5="$HOME5/data/xpkgs/xim-x-xsf-plain/1.0.0"
+[[ -d "$PAYLOAD5" ]] || fail "I5 setup: payload should exist before breaking it"
+rm -rf "$PAYLOAD5"
+chmod -R a-w "$HOME5/subos/other"
+
+i5_rc=0
+i5_out=$(RUN5 default self doctor --fix 2>&1) || i5_rc=$?
+chmod -R u+w "$HOME5/subos/other"
+
+[[ $i5_rc -eq 1 ]] \
+  || fail "I5: a failed cross-subos child must fail the parent's run; got rc=$i5_rc:\n$i5_out"
+grep -q "subos 'other'" <<<"$i5_out" \
+  || fail "I5: the report must name the failed subos; got:\n$i5_out"
+grep -qE "self doctor --fix --subos other.*exited [1-9][0-9]*" <<<"$i5_out" \
+  || fail "I5: the report must show the exact child command and that it failed; got:\n$i5_out"
+
+i5_verified=$(python3 -c "
+import json, pathlib
+print(json.loads(pathlib.Path('$HOME5/.xlings.json').read_text()).get('verifiedBy', ''))
+")
+[[ -z "$i5_verified" ]] \
+  || fail "I5: verifiedBy must not be written while a cross-subos child failed; got '$i5_verified'"
 
 log "PASS: doctor_cross_subos_fix"

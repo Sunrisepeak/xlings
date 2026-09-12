@@ -479,6 +479,22 @@ struct RepairReport {
     // did not happen. A finding that vanished because its registration was
     // dropped was not healed: nothing about it was made to work.
     std::vector<std::pair<std::string, std::string>> prunedEntries;
+    // Subos the cross-subos walk (repair_other_subos_walk_) could not
+    // repair: name, and the child's exit code (-1 when the walk refused to
+    // even run it -- an unsafe name).
+    //
+    // NOT folded into `failedEntries`, which is keyed by (target, version):
+    // this failure is per-SUBOS, and a child that dies before printing a
+    // single finding leaves nothing to key by. Kept separate so a caller
+    // can name the subos and the command to re-run without guessing which
+    // (target, version) pairs were behind it -- the render layer already
+    // gets that from the note text; this is what gates the exit code and
+    // the stamp the same way an outstanding failedEntries victim does. A
+    // subos that failed here is, by definition, not converged: its findings
+    // were never re-detected by THIS process (the child exited already
+    // anchored to it), so there is no `stillFound`-style check to run --
+    // its mere presence in this list is the outstanding work.
+    std::vector<std::pair<std::string, int>> failedSubos;
     // Commands `--dry-run` would have run.
     std::vector<std::string> planned;
     // `--fix` ended with more issues than it started with. Sets the exit code
