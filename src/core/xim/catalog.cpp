@@ -96,7 +96,21 @@ std::vector<std::string> concrete_versions_(
     std::unordered_set<std::string> seen;
     for (const auto& [ver, entry] : versions) {
         if (ver == "latest") continue;
-        const std::string& concrete = entry.ref.empty() ? ver : entry.ref;
+        std::string concrete = entry.ref.empty() ? ver : entry.ref;
+        // Follow a CHAIN of aliases to its end, not just its first link.
+        // "8" -> ref "8.0" -> ref "8.0.1" used to stop after one hop, so
+        // ">=8" answered with "8.0" -- itself just another name, never a
+        // directory the store created. Bounded (8 hops) and cycle-safe: a
+        // hand-edited or malformed index that points two aliases at each
+        // other must fail closed (stop and use the last string reached),
+        // not loop forever.
+        std::unordered_set<std::string> visited{ver};
+        for (int hop = 0; hop < 8; ++hop) {
+            if (!visited.insert(concrete).second) break;  // cycle
+            auto it = versions.find(concrete);
+            if (it == versions.end() || it->second.ref.empty()) break;
+            concrete = it->second.ref;
+        }
         if (seen.insert(concrete).second) out.push_back(concrete);
     }
     return out;
