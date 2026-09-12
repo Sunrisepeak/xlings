@@ -18,6 +18,10 @@
 #       its payload is gone -- is pruned by `--fix --dry-run`, not queued
 #       for reinstall (D2): the plan says `prune`, never `would run ...
 #       install` for that entry.
+#   I9b the same entry, once one subos here cannot even be read: an
+#       unreadable subos is a possible claimant, not a non-claimant, so
+#       D2 must not prune past it (2026.9.12, F2) -- the plan now says
+#       `would run ... install` instead.
 #   I5  a cross-subos child that genuinely FAILS (`self doctor --fix
 #       --subos <name>` exits non-zero) must be visible in the PARENT's
 #       verdict, not swallowed as a note nobody's exit code reflects: the
@@ -71,9 +75,17 @@ package = {
     authors = {"xlings-ci"}, licenses = {"MIT"}, type = "package",
     archs = {"x86_64"}, status = "stable", categories = {"test-fixture"},
     xpm = {
-        linux   = { ["1.0.0"] = {} },
-        macosx  = { ["1.0.0"] = {} },
-        windows = { ["1.0.0"] = {} },
+        -- 9.9.9 is declared but never installed: I9/I9b hand-write a DB
+        -- entry for it (unclaimed by any workspace) precisely so the
+        -- catalog CAN still resolve the coordinate -- the case D2 (and
+        -- F2's unreadable-subos guard on it) is about. Without a real
+        -- declared version here, `owning_coordinate_` would fail to
+        -- resolve it at all and the finding would take the SEPARATE
+        -- "unowned" path instead, which prints a near-identical `prune`
+        -- line and would make I9/I9b pass without ever exercising D2.
+        linux   = { ["1.0.0"] = {}, ["9.9.9"] = {} },
+        macosx  = { ["1.0.0"] = {}, ["9.9.9"] = {} },
+        windows = { ["1.0.0"] = {}, ["9.9.9"] = {} },
     },
 }
 import("xim.libxpkg.pkginfo")
@@ -183,8 +195,40 @@ run_capture default self doctor --fix --dry-run
   || fail "I9: the unclaimed broken entry should still count as an issue; got:\n$out"
 grep -q "prune xsf-plain@9\.9\.9" <<<"$out" \
   || fail "I9: the plan must prune the unclaimed entry; got:\n$out"
-grep -qE "would run .*install xsf-plain@9\.9\.9" <<<"$out" \
+# A genuine toInstall planned line has the "(N entries)" suffix
+# repair_payloads_ appends only to THAT loop's own lines -- not the
+# substring "install xim:xsf-plain@9.9.9", which also appears embedded
+# inside the PRUNE line's own remedy text ("prune ... `xlings install ...`
+# brings it back") now that the coordinate resolves. Matching on the
+# suffix is what tells "queued for reinstall" apart from "prune line that
+# happens to mention install".
+grep -qE "install (xim:)?xsf-plain@9\.9\.9[[:space:]]+\([0-9]+ entr" <<<"$out" \
   && fail "I9: the unclaimed entry must not be queued for reinstall; got:\n$out"
+
+# ── I9b: an unreadable subos is a possible claimant, so D2 prunes nothing
+#         past it (2026.9.12, F2) ────────────────────────────────────────
+#
+# Same otherwise-unclaimed entry as I9. The only thing that changes is that
+# one subos directory here now cannot be read at all -- and a scan that
+# cannot open every subos cannot know every subos does NOT reference
+# 9.9.9 either. Before this, `unclaimed` only asked the subos this scan
+# COULD read, so a corrupted sibling subos that happened to be the one
+# still using an entry would have it pruned out from under it, silently.
+log "I9b: an unreadable subos present -> the same entry is no longer pruned"
+mkdir -p "$HOME_DIR/subos/ghostly"
+printf '{garbage' > "$HOME_DIR/subos/ghostly/.xlings.json"
+
+run_capture default self doctor --fix --dry-run
+[[ $rc -ne 0 ]] \
+  || fail "I9b: the still-broken entry should still count as an issue; got:\n$out"
+grep -q "prune xsf-plain@9\.9\.9" <<<"$out" \
+  && fail "I9b: an unreadable subos might still reference this entry -- it must not be pruned; got:\n$out"
+grep -qE "install (xim:)?xsf-plain@9\.9\.9[[:space:]]+\([0-9]+ entr" <<<"$out" \
+  || fail "I9b: no longer unclaimed, so it must be queued for reinstall instead; got:\n$out"
+grep -qi "ghostly" <<<"$out" \
+  || fail "I9b: the unreadable subos itself must still be named in the report; got:\n$out"
+
+rm -rf "$HOME_DIR/subos/ghostly"
 
 # ── I5: an owning subos whose NAME is not a safe shell token fails the
 #        whole run, and is never actually shelled out to ──────────────────
