@@ -17,6 +17,10 @@
 #       found and removed by `remove <name>` (DB-first resolution)
 #   S6  `remove <name> --all-subos` removes it from every subos that has it
 #   S7  `remove <name> --all` removes every version, highest first
+#   S8  a sibling subos whose `.xlings.json` cannot be read blocks a full
+#       removal (detach-only instead), names the subos, and is NOT
+#       overridden by `--force`; fixing the file lets removal proceed
+#       (2026.9.12, Item A)
 #
 # Every scenario ends with assert_gone, which checks all four places state
 # can hide: the version DB, every subos workspace, every subos's program
@@ -285,6 +289,50 @@ assert_gone plain 1.0.0 "S7 (1.0.0)"
 assert_gone plain 2.0.0 "S7 (2.0.0)"
 log "  PASS: --all cleared every version"
 
+# ── S8: an unreadable sibling subos is treated as "might still use this
+#        payload" (2026.9.12, Item A controller ruling) ──────────────────
+#
+# Before this, a subos whose `.xlings.json` could not be read was simply
+# invisible to every cross-subos scan -- `remove` read that as "nobody else
+# uses this" and did a FULL removal (payload deleted) even though the
+# unreadable subos might still be actively using the exact version being
+# removed. Now it is read the other way: unreadable means "cannot rule out
+# still in use", so `remove` detaches only, keeps the payload, names the
+# subos it could not check, and points at the repair command -- and
+# `--force` does NOT override this, because deleting a payload a DIFFERENT
+# subos may need is not "force removing this package", it is damaging that
+# other subos.
+log "S8: unreadable sibling subos blocks a full removal, --force does not override it"
+RUN subos new other2 >/dev/null 2>&1 || fail "S8 setup: subos new other2 failed"
+RUN_IN default install plain@1.0.0 -y >/dev/null 2>&1 || fail "S8 setup: default install failed"
+RUN_IN other2  install plain@1.0.0 -y >/dev/null 2>&1 || fail "S8 setup: other2 install failed"
+WS_OTHER2="$HOME_DIR/subos/other2/.xlings.json"
+cp "$WS_OTHER2" "$RUNTIME_DIR/other2-ws.bak"
+printf '{garbage' > "$WS_OTHER2"
+
+PLAIN_STORE8="$(find "$HOME_DIR/data/xpkgs" -maxdepth 1 -type d -name '*-x-plain' | head -1)"
+[[ -n "$PLAIN_STORE8" ]] || fail "S8 setup: could not find plain's store dir"
+
+RUN_IN default remove plain -y >"$RUNTIME_DIR/s8a.out" 2>&1 \
+  || { sed 's/^/    | /' "$RUNTIME_DIR/s8a.out" >&2; fail "S8a: remove should exit 0 (detach-only)"; }
+[[ -d "$PLAIN_STORE8/1.0.0" ]] \
+  || fail "S8a: payload must still be on disk -- an unreadable subos might still use it"
+assert_contains "$(cat "$RUNTIME_DIR/s8a.out")" "other2" \
+  "S8a: stderr must name the unreadable subos"
+
+RUN_IN default remove plain --force -y >"$RUNTIME_DIR/s8b.out" 2>&1 \
+  || { sed 's/^/    | /' "$RUNTIME_DIR/s8b.out" >&2; fail "S8b: remove --force should exit 0 (still detach-only)"; }
+[[ -d "$PLAIN_STORE8/1.0.0" ]] \
+  || fail "S8b: --force must not delete a payload another (unreadable) subos may need"
+assert_contains "$(cat "$RUNTIME_DIR/s8b.out")" "does not override" \
+  "S8b: stderr must say --force does not override this"
+
+cp "$RUNTIME_DIR/other2-ws.bak" "$WS_OTHER2"
+RUN_IN other2 remove plain -y >"$RUNTIME_DIR/s8c.out" 2>&1 \
+  || { sed 's/^/    | /' "$RUNTIME_DIR/s8c.out" >&2; fail "S8c: remove in other2 (fixed) should exit 0"; }
+assert_gone plain 1.0.0 "S8c"
+log "  PASS: an unreadable subos is treated as a user of the payload, and --force does not override that"
+
 # ── S3: the recipe has left the index entirely -- run last, it deletes it ──
 log "S3: recipe removed from the index, then remove --force"
 RUN install plain@1.0.0 -y >/dev/null 2>&1 || fail "S3 setup: install failed"
@@ -297,4 +345,4 @@ assert_contains "$(cat "$RUNTIME_DIR/s3.out")" "no index provides" \
 assert_gone plain 1.0.0 "S3"
 log "  PASS: a version record survives its recipe, and --force can still clear it"
 
-log "PASS: remove --force / --all / --all-subos contract (S1-S7)"
+log "PASS: remove --force / --all / --all-subos contract (S1-S8)"
