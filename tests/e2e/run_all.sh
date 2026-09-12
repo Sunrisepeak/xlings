@@ -213,6 +213,13 @@ TESTS=(
     # an untouched sibling package proving none of it spread. Task 8 of the
     # 2026-09-12 robustness/usability round.
     "E2E-106|broken_home_isolation_test.sh||"
+    # Installing a payload already on disk (installed in some OTHER subos)
+    # into a second subos must register it there too, not just try to
+    # activate a target it never wrote into that subos's own installed[]
+    # (task-7-report.md's "surfaced defect", 2026.9.12 Item C). Regression
+    # guard: this does not reproduce against HEAD (already per-subos-aware),
+    # so this asserts the correct behaviour rather than a fix.
+    "E2E-107|second_subos_install_test.sh||"
 )
 
 # ── orphan check: a test that runs NOWHERE looks exactly like one that passes ──
