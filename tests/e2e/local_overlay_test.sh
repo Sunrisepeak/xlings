@@ -17,6 +17,10 @@
 #   S5  `--remove-xpkg` deletes one Unique entry by name
 #   S6  `xlings update` auto-GCs an entry that has become byte-identical to
 #       the synced index, without being asked
+#   S7  a recipe dropped straight into pkgs/ with NO add-xpkg and NO
+#       .overlay.json entry (the 157-of-159 shape: everything a
+#       pre-2026.9.12 build ever added) is still GC'd when identical, and
+#       still shown -- as "untracked" -- when modified and surviving
 #   I6  a same-VERSION local duplicate does not print "namespace priority"
 #       on `info <bare-name>` (silenced by a parallel task in this round;
 #       see below if it is not yet merged in this worktree)
@@ -187,6 +191,65 @@ if [[ -f "$HOME_DIR/data/xim-pkgindex-local/pkgs/m/make.lua" ]]; then
     fail "S6: the now-identical overlay recipe should have been removed"
 fi
 echo "   ok — update auto-GC'd the converged entry"
+
+echo "== S7: an untracked recipe (no add-xpkg, no provenance) is GC'd when identical, and survives+lists when modified =="
+mkdir -p "$HOME_DIR/data/xim-pkgindex-local/pkgs/m"
+# Byte-identical to what's already synced, dropped straight into pkgs/ --
+# bypassing add-xpkg entirely. No .overlay.json entry at all: exactly what a
+# pre-2026.9.12 build left behind, and the shape 157 of a real overlay's 159
+# recipes were in.
+cp "$UPSTREAM_RECIPE" "$HOME_DIR/data/xim-pkgindex-local/pkgs/m/make.lua"
+
+out="$(run_x config --list-xpkg 2>&1)"
+if ! grep "^make " <<<"$out" | grep -qi "untracked"; then
+    echo "$out"
+    fail "S7: an untracked recipe should list with an 'untracked' source"
+fi
+
+out="$(run_x update 2>&1)" || { echo "$out"; fail "S7: update failed"; }
+if ! grep -qi "identical to the synced index were removed" <<<"$out"; then
+    echo "$out"
+    fail "S7: update should auto-GC an untracked identical recipe, not just a tracked one"
+fi
+if [[ -f "$HOME_DIR/data/xim-pkgindex-local/pkgs/m/make.lua" ]]; then
+    fail "S7: the untracked identical recipe should have been removed"
+fi
+
+# Same shape, but modified: same declared version, different bytes, still no
+# provenance record. Must survive `update` (Modified, not Identical) and
+# still be visible in --list-xpkg.
+#
+# `pkgs/m/` itself was just deleted above -- `remove_recipe_file` (and so
+# the GC that just ran) removes a letter directory once it's the last file
+# in it -- so it needs remaking before writing into it again.
+mkdir -p "$HOME_DIR/data/xim-pkgindex-local/pkgs/m"
+cp "$UPSTREAM_RECIPE" "$HOME_DIR/data/xim-pkgindex-local/pkgs/m/make.lua"
+sed -i.bak 's/GNU Make v4.4 —/GNU Make v4.4 (untracked, hand-edited) —/' \
+    "$HOME_DIR/data/xim-pkgindex-local/pkgs/m/make.lua"
+rm -f "$HOME_DIR/data/xim-pkgindex-local/pkgs/m/make.lua.bak"
+
+out="$(run_x update 2>&1)" || { echo "$out"; fail "S7: second update failed"; }
+if grep -qi "identical to the synced index were removed" <<<"$out"; then
+    echo "$out"
+    fail "S7: a modified untracked recipe must not be GC'd"
+fi
+if [[ ! -f "$HOME_DIR/data/xim-pkgindex-local/pkgs/m/make.lua" ]]; then
+    fail "S7: the modified untracked recipe should have survived update"
+fi
+
+out="$(run_x config --list-xpkg 2>&1)"
+if ! grep "^make " <<<"$out" | grep -qi "modified"; then
+    echo "$out"
+    fail "S7: the surviving untracked recipe should list as 'modified'"
+fi
+if ! grep "^make " <<<"$out" | grep -qi "untracked"; then
+    echo "$out"
+    fail "S7: the surviving untracked recipe should still show an 'untracked' source"
+fi
+echo "   ok — untracked identical recipe GC'd by update; untracked modified recipe survives and lists"
+
+# Reset before I6, which sets up its own pkgs/m/make.lua state from scratch.
+run_x config --clear-xpkg all >/dev/null 2>&1 || true
 
 echo "== I6: a same-version local duplicate does not shout 'namespace priority' =="
 mkdir -p "$HOME_DIR/data/xim-pkgindex-local/pkgs/m"

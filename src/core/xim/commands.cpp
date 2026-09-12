@@ -1952,7 +1952,10 @@ int cmd_add_xpkg(const std::string& fileOrUrl, EventStream& stream) {
     auto sha = overlay::file_sha256(luaFile);
     for (auto& [repoName, upstreamPath] : overlay::upstream_candidates(name)) {
         if (sha.empty() || overlay::file_sha256(upstreamPath) != sha) continue;
-        fs::remove(luaFile);
+        // Removes the file AND the letter directory `create_directories`
+        // just made above, if this was the only recipe in it -- a refusal
+        // should leave no trace, not an empty `pkgs/<letter>/`.
+        overlay::remove_recipe_file(luaFile);
         diag::emit({
             .level   = diag::Level::Note,
             .code    = "xim.overlay_identical",
@@ -2033,12 +2036,19 @@ int cmd_add_xpkg(const std::string& fileOrUrl, EventStream& stream) {
 
 int cmd_list_xpkg() {
     auto dir = overlay::dir();
-    auto entries = overlay::load(dir);
-    if (entries.empty()) {
+    // `load_with_files`, not `load`: a pre-2026.9.12 `--add-xpkg` never
+    // wrote a provenance entry, and those recipes are most of a real
+    // overlay (159 on the machine that motivated this feature, 157 with no
+    // record at all). Listing only `.overlay.json` would say "empty" over
+    // an overlay full of exactly what this command exists to show.
+    auto discovered = overlay::load_with_files(dir);
+    if (discovered.empty()) {
         log::println("no local recipes (add one with "
                      "`xlings config --add-xpkg <file>`)");
         return 0;
     }
+    std::ranges::sort(discovered, {},
+                      [](auto& d) -> const std::string& { return d.entry.name; });
 
     auto kind_label = [](overlay::Status::Kind k) -> std::string_view {
         switch (k) {
@@ -2051,12 +2061,16 @@ int cmd_list_xpkg() {
     };
 
     log::println("{:<24} {:<12} {:<10} {}", "name", "version", "status", "source");
-    for (auto& [name, entry] : entries) {
-        auto localFile = overlay::recipe_path(dir, name);
-        auto status = overlay::status_of(entry, localFile);
-        auto version = entry.version.empty() ? "-" : entry.version;
-        log::println("{:<24} {:<12} {:<10} {}", name, version,
-                     kind_label(status.kind), entry.source);
+    for (auto& item : discovered) {
+        auto status = overlay::status_of(item.entry, item.path);
+        auto version = item.entry.version.empty() ? "-" : item.entry.version;
+        // "untracked": no provenance record exists for this recipe at all
+        // (added before this feature, or dropped into pkgs/ by hand) --
+        // distinct from a recorded-but-blank source, which this codebase
+        // never produces but which "unknown" would wrongly suggest.
+        auto source = item.entry.source.empty() ? "untracked" : item.entry.source;
+        log::println("{:<24} {:<12} {:<10} {}", item.entry.name, version,
+                     kind_label(status.kind), source);
     }
     return 0;
 }
@@ -2072,12 +2086,7 @@ int cmd_remove_xpkg(const std::string& name) {
         log::error("no local recipe named '{}'", name);
         return 1;
     }
-    if (hadFile) std::filesystem::remove(localFile, ec);
-    auto letterDir = localFile.parent_path();
-    if (std::filesystem::is_directory(letterDir, ec)
-            && std::filesystem::is_empty(letterDir, ec)) {
-        std::filesystem::remove(letterDir, ec);
-    }
+    overlay::remove_recipe_file(localFile);
     if (it != entries.end()) entries.erase(it);
     overlay::save(dir, entries);
 
@@ -2094,28 +2103,28 @@ int cmd_clear_xpkg(const std::string& what) {
     }
 
     auto dir = overlay::dir();
-    auto entries = overlay::load(dir);
+    // Same reasoning as `cmd_list_xpkg`: `--clear-xpkg all` (or a `stale`
+    // recipe long since caught up by the index) must reach an untracked
+    // recipe too, not just ones added since this feature shipped. Only
+    // entries that were ALREADY tracked are erased from `.overlay.json`
+    // below -- a surviving untracked recipe must not be adopted into
+    // provenance merely because this command looked at it.
+    auto tracked = overlay::load(dir);
+    auto discovered = overlay::load_with_files(dir);
     std::vector<std::string> removed;
-    for (auto& [name, entry] : entries) {
-        auto localFile = overlay::recipe_path(dir, name);
+    for (auto& item : discovered) {
         bool shouldRemove = what == "all";
         if (!shouldRemove) {
-            auto status = overlay::status_of(entry, localFile);
+            auto status = overlay::status_of(item.entry, item.path);
             shouldRemove = status.kind == overlay::Status::Identical
                         || status.kind == overlay::Status::Behind;
         }
         if (!shouldRemove) continue;
-        std::error_code ec;
-        std::filesystem::remove(localFile, ec);
-        auto letterDir = localFile.parent_path();
-        if (std::filesystem::is_directory(letterDir, ec)
-                && std::filesystem::is_empty(letterDir, ec)) {
-            std::filesystem::remove(letterDir, ec);
-        }
-        removed.push_back(name);
+        overlay::remove_recipe_file(item.path);
+        removed.push_back(item.entry.name);
     }
-    for (auto& name : removed) entries.erase(name);
-    overlay::save(dir, entries);
+    for (auto& name : removed) tracked.erase(name);
+    overlay::save(dir, tracked);
 
     if (removed.empty()) {
         log::println("no local recipes matched '{}'", what);

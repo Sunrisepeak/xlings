@@ -314,3 +314,157 @@ TEST(OverlayGc, NoOpWhenNothingIdentical) {
     EXPECT_TRUE(fs::exists(overlay::recipe_path(overlayDir, "solo")));
     fs::remove_all(root);
 }
+
+// ── load_with_files: the untracked case (fix round 1, Finding 1) ────────
+//
+// A pre-2026.9.12 `--add-xpkg` never wrote a `.overlay.json` entry. On a
+// real machine that is 159 of 159 recipes. `load_with_files` is what makes
+// `--list-xpkg`, `--clear-xpkg`, and `gc_identical` see those too.
+
+TEST(OverlayLoadWithFiles, EmptyOverlayIsEmpty) {
+    auto root = make_temp_dir("lwf-empty");
+    EXPECT_TRUE(overlay::load_with_files(root).empty());
+    fs::remove_all(root);
+}
+
+TEST(OverlayLoadWithFiles, SynthesizesAnEntryForAnUntrackedFile) {
+    auto root = make_temp_dir("lwf-untracked");
+    write_recipe(root, "orphan", "2.5.0");
+    // Deliberately no .overlay.json at all -- the 157-of-159 shape.
+
+    auto discovered = overlay::load_with_files(root);
+    ASSERT_EQ(discovered.size(), 1u);
+    auto& item = discovered.front();
+    EXPECT_EQ(item.entry.name, "orphan");
+    EXPECT_EQ(item.entry.source, "");
+    EXPECT_FALSE(item.entry.addedAt.empty());   // synthesized from mtime
+    EXPECT_FALSE(item.entry.sha256.empty());
+    EXPECT_EQ(item.entry.version, "2.5.0");     // read fresh from the file
+    EXPECT_EQ(item.path, overlay::recipe_path(root, "orphan"));
+    EXPECT_FALSE(item.tracked);
+    fs::remove_all(root);
+}
+
+TEST(OverlayLoadWithFiles, DoesNotDuplicateATrackedFile) {
+    auto root = make_temp_dir("lwf-tracked");
+    write_recipe(root, "alpha", "1.0.0");
+    std::map<std::string, overlay::Entry> entries;
+    entries["alpha"] = {.name = "alpha", .source = "user gave this",
+                        .version = "1.0.0"};
+    overlay::save(root, entries);
+
+    auto discovered = overlay::load_with_files(root);
+    ASSERT_EQ(discovered.size(), 1u);
+    EXPECT_EQ(discovered.front().entry.name, "alpha");
+    EXPECT_EQ(discovered.front().entry.source, "user gave this");
+    EXPECT_TRUE(discovered.front().tracked);
+    fs::remove_all(root);
+}
+
+TEST(OverlayLoadWithFiles, MixesTrackedAndUntracked) {
+    auto root = make_temp_dir("lwf-mixed");
+    write_recipe(root, "tracked_one", "1.0.0");
+    write_recipe(root, "untracked_one", "1.0.0");
+    std::map<std::string, overlay::Entry> entries;
+    entries["tracked_one"] = {.name = "tracked_one", .version = "1.0.0"};
+    overlay::save(root, entries);
+
+    auto discovered = overlay::load_with_files(root);
+    ASSERT_EQ(discovered.size(), 2u);
+    bool sawTracked = false, sawUntracked = false;
+    for (auto& item : discovered) {
+        if (item.entry.name == "tracked_one") sawTracked = item.tracked;
+        if (item.entry.name == "untracked_one") sawUntracked = !item.tracked;
+    }
+    EXPECT_TRUE(sawTracked);
+    EXPECT_TRUE(sawUntracked);
+    fs::remove_all(root);
+}
+
+// ── the two scenarios the review named explicitly ────────────────────
+
+TEST(OverlayGc, RemovesAnUntrackedIdenticalFile) {
+    auto root = make_temp_dir("gc-untracked-identical");
+    auto upstreamDir = root / "xim";
+    auto overlayDir = root / "overlay";
+
+    write_recipe(upstreamDir, "orphan", "1.0.0");
+    fs::create_directories(overlayDir / "pkgs" / "o");
+    fs::copy_file(overlay::recipe_path(upstreamDir, "orphan"),
+                 overlay::recipe_path(overlayDir, "orphan"));
+    // No .overlay.json at all -- this recipe was never added through
+    // this feature's `--add-xpkg`.
+    ASSERT_FALSE(fs::exists(overlayDir / ".overlay.json"));
+
+    std::vector<overlay::RepoDir> repos = {{"xim", upstreamDir}};
+    auto removed = overlay::gc_identical(overlayDir, repos);
+
+    ASSERT_EQ(removed.size(), 1u);
+    EXPECT_EQ(removed[0], "orphan");
+    EXPECT_FALSE(fs::exists(overlay::recipe_path(overlayDir, "orphan")));
+    // GC must not have adopted it into provenance on the way out.
+    EXPECT_TRUE(overlay::load(overlayDir).empty());
+
+    fs::remove_all(root);
+}
+
+TEST(OverlayLoadWithFiles, AnUntrackedModifiedFileReportsModified) {
+    auto root = make_temp_dir("lwf-untracked-modified");
+    auto upstreamDir = root / "xim";
+    auto overlayDir = root / "overlay";
+
+    write_recipe(upstreamDir, "orphan", "1.0.0");
+    // Same declared version, different bytes -- an untracked recipe someone
+    // hand-edited, not simply behind.
+    write_recipe(overlayDir, "orphan", "1.0.0", " (hand-edited, untracked)");
+
+    std::vector<overlay::RepoDir> repos = {{"xim", upstreamDir}};
+    auto discovered = overlay::load_with_files(overlayDir);
+    ASSERT_EQ(discovered.size(), 1u);
+    auto& item = discovered.front();
+    EXPECT_FALSE(item.tracked);
+
+    auto candidates = overlay::upstream_candidates("orphan", repos);
+    auto status = overlay::status_of(item.entry, item.path, candidates);
+    EXPECT_EQ(status.kind, overlay::Status::Modified);
+
+    // `gc_identical` must leave it alone -- Modified, not Identical.
+    auto removed = overlay::gc_identical(overlayDir, repos);
+    EXPECT_TRUE(removed.empty());
+    EXPECT_TRUE(fs::exists(overlay::recipe_path(overlayDir, "orphan")));
+
+    fs::remove_all(root);
+}
+
+// ── remove_recipe_file (fix round 1, Finding 2: one shared implementation) ──
+
+TEST(OverlayRemoveRecipeFile, RemovesFileAndEmptyLetterDir) {
+    auto root = make_temp_dir("remove-file");
+    write_recipe(root, "solo", "1.0.0");
+    auto file = overlay::recipe_path(root, "solo");
+    ASSERT_TRUE(fs::exists(file));
+
+    EXPECT_TRUE(overlay::remove_recipe_file(file));
+    EXPECT_FALSE(fs::exists(file));
+    EXPECT_FALSE(fs::exists(file.parent_path()));  // the now-empty letter dir
+    fs::remove_all(root);
+}
+
+TEST(OverlayRemoveRecipeFile, LeavesTheLetterDirIfNotEmpty) {
+    auto root = make_temp_dir("remove-file-shared-dir");
+    write_recipe(root, "alpha", "1.0.0");
+    write_recipe(root, "another", "1.0.0");  // shares the "a" letter dir
+    auto file = overlay::recipe_path(root, "alpha");
+
+    EXPECT_TRUE(overlay::remove_recipe_file(file));
+    EXPECT_FALSE(fs::exists(file));
+    EXPECT_TRUE(fs::exists(file.parent_path()));  // "another" is still there
+    EXPECT_TRUE(fs::exists(overlay::recipe_path(root, "another")));
+    fs::remove_all(root);
+}
+
+TEST(OverlayRemoveRecipeFile, MissingFileIsNotAnError) {
+    auto root = make_temp_dir("remove-file-missing");
+    EXPECT_FALSE(overlay::remove_recipe_file(root / "pkgs" / "n" / "nope.lua"));
+    fs::remove_all(root);
+}

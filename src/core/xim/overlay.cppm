@@ -33,6 +33,15 @@ import xlings.core.version_order;
 // (`Config::global_index_repos()` + discovered sub-repos), and the
 // `std::span<const RepoDir>` overload takes an injected list instead — so a
 // unit test can build a fake "upstream" directory without a real home.
+//
+// `.overlay.json` only exists from this module onward, so on its own it
+// answers "what has been added SINCE this module shipped" — every one of
+// the 159 recipes on a real machine, added by years of earlier `xlings`
+// builds, has no entry there at all. `load_with_files` is the fix: it
+// merges `.overlay.json` with a scan of `pkgs/*/*.lua` and synthesizes an
+// entry for anything not already tracked, so `--list-xpkg`, `--clear-xpkg`
+// and `xlings update`'s GC see the whole overlay, not just what post-dates
+// this feature.
 export namespace xlings::xim::overlay {
 
 struct Entry {
@@ -57,6 +66,20 @@ struct Status {
     std::string upstreamVersion;
 };
 
+// One recipe `load_with_files` found under `dir`'s pkgs/ tree, tracked or
+// not. `path` is the file's REAL on-disk location, deliberately not
+// recomputed from `entry.name` via `recipe_path()`: a recipe added before
+// this module existed can sit in a letter bucket keyed by its declared
+// package name while its own filename is something else entirely (the
+// exact shape `cmd_add_xpkg` itself produced before its destination-name
+// fix) — for an untracked entry, `recipe_path(dir, entry.name)` is not a
+// safe way to find it back.
+struct DiscoveredEntry {
+    Entry entry;
+    std::filesystem::path path;
+    bool tracked = false;
+};
+
 // Where the overlay lives: Config::global_data_dir()/"xim-pkgindex-local".
 std::filesystem::path dir();
 
@@ -72,6 +95,17 @@ std::map<std::string, Entry> load(const std::filesystem::path& dir);
 
 void save(const std::filesystem::path& dir,
          const std::map<std::string, Entry>& entries);
+
+// `load()`'s tracked entries, PLUS a synthesized entry for every `.lua`
+// recipe under `dir`'s pkgs/ tree that has NO provenance record — the
+// 157-of-159 case this module exists for: every recipe `--add-xpkg` added
+// before this module existed, and any file dropped into the overlay by
+// hand. A synthesized entry's `name` is the FILENAME's stem (not the
+// recipe's declared package name, which can differ — see `DiscoveredEntry`),
+// `source` is `""`, `addedAt` is the file's mtime, `sha256`/`version` are
+// read fresh from the file. A file already covered by a tracked entry is
+// not duplicated. Order is unspecified; sort by `entry.name` for display.
+std::vector<DiscoveredEntry> load_with_files(const std::filesystem::path& dir);
 
 // Lowercase hex sha256 of a file's bytes; "" if it can't be read.
 std::string file_sha256(const std::filesystem::path& path);
@@ -102,6 +136,14 @@ Status status_of(const Entry& entry, const std::filesystem::path& localFile);
 // `gc_identical`'s injectable overload, and unit tests, use.
 Status status_of(const Entry& entry, const std::filesystem::path& localFile,
                  std::span<const std::pair<std::string, std::filesystem::path>> candidates);
+
+// Deletes `recipeFile` and, if that leaves its parent (letter) directory
+// empty, removes the directory too. Best-effort and idempotent: a file
+// that is already gone is not an error (the non-throwing `remove` overload
+// already treats "does not exist" as "nothing to do"). Returns whether a
+// file was actually removed. The one place `--remove-xpkg`, `--clear-xpkg`
+// and `gc_identical` all did the same two-step delete, independently.
+bool remove_recipe_file(const std::filesystem::path& recipeFile);
 
 // Removes every overlay entry (file + provenance record) whose status is
 // Identical, real-config-backed. Returns the names removed.

@@ -41,12 +41,30 @@ std::vector<RepoDir> real_repo_dirs_() {
 
 } // namespace detail_
 
-std::string now_utc_iso() {
-    auto now   = std::chrono::system_clock::now();
-    auto nowTT = std::chrono::system_clock::to_time_t(now);
+namespace detail_ {
+
+std::string iso_utc_from_time_t_(std::time_t tt) {
     char buf[32];
-    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&nowTT));
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&tt));
     return buf;
+}
+
+// A file's mtime as the same ISO-8601 UTC shape `now_utc_iso()` produces —
+// used for a synthesized (untracked) entry's `addedAt`, since there is no
+// real "when was this added" for a file this module never wrote.
+std::string mtime_utc_iso_(const fs::path& path) {
+    std::error_code ec;
+    auto ftime = fs::last_write_time(path, ec);
+    if (ec) return "";
+    auto sysTime = std::chrono::clock_cast<std::chrono::system_clock>(ftime);
+    return iso_utc_from_time_t_(std::chrono::system_clock::to_time_t(sysTime));
+}
+
+} // namespace detail_
+
+std::string now_utc_iso() {
+    return detail_::iso_utc_from_time_t_(
+        std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));
 }
 
 std::optional<std::string> declared_latest(const fs::path& recipeFile) {
@@ -129,6 +147,56 @@ std::string file_sha256(const fs::path& path) {
     return sha256::hex_file(path).value_or("");
 }
 
+std::vector<DiscoveredEntry> load_with_files(const fs::path& dir) {
+    std::vector<DiscoveredEntry> out;
+    auto tracked = load(dir);
+    out.reserve(tracked.size());
+    for (auto& [name, entry] : tracked) {
+        out.push_back({entry, recipe_path(dir, name), true});
+    }
+
+    auto pkgsDir = dir / "pkgs";
+    std::error_code ec;
+    if (!fs::is_directory(pkgsDir, ec)) return out;
+
+    for (auto it = fs::recursive_directory_iterator(
+             pkgsDir, fs::directory_options::skip_permission_denied, ec);
+         !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+        std::error_code fileEc;
+        if (!it->is_regular_file(fileEc) || fileEc) continue;
+        const auto& path = it->path();
+        if (path.extension() != ".lua") continue;
+
+        // Filename stem, not the recipe's declared package name: a recipe
+        // added before this module existed can be filed under a letter
+        // bucket named after its declared package while its OWN file is
+        // named something else entirely (see `DiscoveredEntry`'s comment).
+        // Its provenance is genuinely unknown -- the filename is all there
+        // is to identify it by.
+        auto name = path.stem().string();
+        if (tracked.contains(name)) continue;  // already covered above
+
+        Entry synthesized;
+        synthesized.name    = name;
+        synthesized.source  = "";
+        synthesized.addedAt = detail_::mtime_utc_iso_(path);
+        synthesized.sha256  = file_sha256(path);
+        synthesized.version = declared_latest(path).value_or("");
+        out.push_back({std::move(synthesized), path, false});
+    }
+    return out;
+}
+
+bool remove_recipe_file(const fs::path& recipeFile) {
+    std::error_code ec;
+    bool removed = fs::remove(recipeFile, ec);
+    auto letterDir = recipeFile.parent_path();
+    if (fs::is_directory(letterDir, ec) && fs::is_empty(letterDir, ec)) {
+        fs::remove(letterDir, ec);
+    }
+    return removed;
+}
+
 std::vector<std::pair<std::string, fs::path>>
 upstream_candidates(std::string_view name, std::span<const RepoDir> repos) {
     std::vector<std::pair<std::string, fs::path>> found;
@@ -198,26 +266,24 @@ Status status_of(const Entry& entry, const fs::path& localFile) {
 }
 
 std::vector<std::string> gc_identical(const fs::path& dir, std::span<const RepoDir> repos) {
-    auto entries = load(dir);
+    // GC covers untracked recipes too (`load_with_files`) -- a pre-existing
+    // file the synced index has since caught up with is exactly the shape
+    // this exists for. Only TRACKED removals are written back to
+    // `.overlay.json`: an untracked entry that survives must never be
+    // adopted into provenance just because GC looked at it.
+    auto tracked = load(dir);
+    auto discovered = load_with_files(dir);
     std::vector<std::string> removed;
-    for (auto it = entries.begin(); it != entries.end(); ) {
-        auto localFile = recipe_path(dir, it->first);
-        std::error_code ec;
-        if (!fs::is_regular_file(localFile, ec)) { ++it; continue; }
-        auto candidates = upstream_candidates(it->first, repos);
-        auto status = status_of(it->second, localFile, candidates);
+    for (auto& item : discovered) {
+        auto candidates = upstream_candidates(item.entry.name, repos);
+        auto status = status_of(item.entry, item.path, candidates);
         if (status.kind == Status::Identical) {
-            fs::remove(localFile, ec);
-            auto letterDir = localFile.parent_path();
-            if (fs::is_directory(letterDir, ec) && fs::is_empty(letterDir, ec))
-                fs::remove(letterDir, ec);
-            removed.push_back(it->first);
-            it = entries.erase(it);
-        } else {
-            ++it;
+            remove_recipe_file(item.path);
+            removed.push_back(item.entry.name);
         }
     }
-    if (!removed.empty()) save(dir, entries);
+    for (auto& name : removed) tracked.erase(name);
+    if (!removed.empty()) save(dir, tracked);
     return removed;
 }
 
