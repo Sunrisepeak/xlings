@@ -183,6 +183,10 @@ TESTS=(
     # against 2026.9.4.1, where one --fix deleted 1173 sysroot links and
     # dropped 367 registrations with every payload present on disk.
     "E2E-99 |doctor_relocated_home_test.sh||"
+    # The local overlay: provenance, the three verbs, and the GC that removes
+    # what the synced index has already caught up with. Task 4 of the
+    # 2026-09-12 robustness/usability round.
+    "E2E-101|local_overlay_test.sh||"
 )
 
 # ── orphan check: a test that runs NOWHERE looks exactly like one that passes ──
