@@ -194,9 +194,14 @@ TESTS=(
     # recipe's uninstall() runs, and --force/--all/--all-subos make "removed"
     # mean removed no matter what shape the home is in (2026.9.12 Task 5).
     "E2E-102|remove_force_contract_test.sh||"
-    # E2E-102..105 belong to other tasks of the 2026-09-12 robustness/
-    # usability round, not yet merged in every worktree.
-    #
+    # The plain report resolves the same remedy `--deep` does (D1): before
+    # this, a broken payload the index still provides read as "no package
+    # in any index provides this entry" outside `--deep`/`--fix`.
+    "E2E-103|doctor_remedy_mode_parity_test.sh||"
+    # `--fix` walks every subos a finding names, in its own subprocess, so
+    # the user never has to `subos use` first; an unclaimed registration is
+    # pruned rather than re-downloaded (D2).
+    "E2E-104|doctor_cross_subos_fix_test.sh||"
     # Four kinds of damage at once -- an unreadable subos, a DB entry for a
     # package never installed, a deleted overlay recipe file, and a real
     # package's xvm record pointed at a missing bin dir -- and a snapshot of
