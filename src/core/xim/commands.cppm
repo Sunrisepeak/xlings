@@ -92,8 +92,16 @@ std::optional<std::string> index_runtime_abi_of(
 std::string detect_platform();
 
 // Forward declaration for deferred install request processing
+//
+// all: remove every version the version DB has for this target instead of
+// just the resolved one (`--all`).
+// subosScope: nullopt when neither `--subos` nor `--all-subos` was passed
+// (act on the current subos, per the usual membership rules); "*" for
+// `--all-subos` (every subos that references the target); any other value
+// names one subos directly (`--subos <name>`).
 int cmd_remove(const std::string& target, bool yes, EventStream& stream,
-               bool force = false);
+               bool force = false, bool all = false,
+               std::optional<std::string> subosScope = std::nullopt);
 
 // Debounce on-demand index refreshes triggered by install misses (C2 / #366
 // UX): returns true at most once per cooldown window so a tight loop of
@@ -133,14 +141,63 @@ int cmd_install(std::span<const std::string> targets, bool yes, bool noDeps,
 // (pkgmanager.remove inside an xpkg) always pass yes=true: the user already
 // approved the parent install, so the connected uninstall is implicit.
 // CLI-driven `xlings remove <pkg>` defaults to yes=false and bails on n.
+//
+// force: "no matter what, make it gone" -- also tolerates the recipe's
+// uninstall() hook throwing and the recipe not resolving through any index
+// at all. State is withdrawn either way; force only decides whether that is
+// reported as success.
+//
+// all: instead of resolving to one version (the active one, or the lone
+// version registered), remove every version this target has in the version
+// DB, highest first.
+//
+// subosScope: nullopt acts on the current subos (escalating to every subos
+// that references the target only when the target is absent here, present
+// elsewhere, and `yes` was given -- see the membership guard's "remove it
+// everywhere" action for the manual equivalent). "*" (`--all-subos`) acts on
+// every subos that references the target. Any other value (`--subos NAME`)
+// acts on exactly that one subos, whether or not it currently has the
+// target.
 std::expected<bool, std::string>
 selected_payloadless_config_has_uninstall_(
         PackageCatalog& catalog,
         const PackageMatch& match,
         std::string_view platform);
 
+// RAII guard for acting on a named subos for a scoped stretch of code, then
+// restoring both halves of "which subos is current": the XLINGS_ACTIVE_SUBOS
+// env var (what a spawned or re-entered activation path re-reads) and
+// Config's active-subos override (what Config's own cached paths/workspace
+// are derived from).
+//
+// `name.empty()` is a no-op guard -- "stay on the current subos", the common
+// case -- so a caller never needs its own branch for "did I actually switch".
+//
+// Exit restores in the SAME relative order as entry (env var, override, one
+// reload), not the reverse: `Config::set_active_subos_override("")` falls
+// through to reading XLINGS_ACTIVE_SUBOS whenever the restored override is
+// empty, so the env var has to already be back to its previous value BEFORE
+// the override is restored -- restoring the override first would resolve
+// against the env var this guard just switched, landing on the subos being
+// LEFT rather than the one being returned to. The extra explicit
+// `Config::reload_state()` on each end compensates for
+// `set_active_subos_override`'s own reload reading `paths_.activeSubos`
+// before recomputing it, which would otherwise use the state from one
+// transition ago.
+struct ScopedSubosOverride {
+    explicit ScopedSubosOverride(std::string name);
+    ~ScopedSubosOverride();
+    ScopedSubosOverride(const ScopedSubosOverride&) = delete;
+    ScopedSubosOverride& operator=(const ScopedSubosOverride&) = delete;
+
+private:
+    bool active_;
+    std::string prevEnv_;
+    std::string prevOverride_;
+};
+
 int cmd_remove(const std::string& target, bool yes, EventStream& stream,
-               bool force);
+               bool force, bool all, std::optional<std::string> subosScope);
 
 // === search command ===
 int cmd_search(const std::string& keyword, EventStream& stream);

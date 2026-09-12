@@ -79,7 +79,7 @@ TEST(SelfRepairLadder, FallsBackToRemoveThenInstall) {
     EXPECT_EQ(r.rung, "reinstall");
     ASSERT_EQ(f.ran.size(), 3u);
     EXPECT_EQ(f.ran[0], "xlings install linux-headers@5.11.1 -y");
-    EXPECT_EQ(f.ran[1], "xlings remove linux-headers@5.11.1 -y");
+    EXPECT_EQ(f.ran[1], "xlings remove linux-headers@5.11.1 --force -y");
     EXPECT_EQ(f.ran[2], "xlings install linux-headers@5.11.1 -y");
 }
 
@@ -97,15 +97,41 @@ TEST(SelfRepairLadder, RemovedButCouldNotReinstallIsLoudAndActionable) {
               std::string::npos);
 }
 
-TEST(SelfRepairLadder, DoesNotReinstallWhenTheEntryCannotBeRemoved) {
-    FakeRunner f{.codes = {1, 1}};      // install fails, remove fails
-    auto r = repair_one(task(), RepairPolicy{}, runner_of(f));
+// `remove`'s exit code is not trusted for control flow (nor for what gets
+// reported): 2026.9.12's `remove` withdraws the version DB entry, workspace
+// binding and shim BEFORE the recipe's uninstall() hook runs, so a thrown
+// hook exits non-zero with the record already gone. Reading that exit code
+// as "could not be removed" (as this rung used to) skipped the reinstall a
+// genuinely-removed package needed. The verifier, not the exit code, decides
+// both whether R3 succeeded and what gets reported.
+TEST(SelfRepairLadder, RunsInstallEvenWhenRemoveExitsNonZeroAndReportsByVerifier) {
+    FakeRunner f{.codes = {1, 1, 0}};   // install fails, remove "fails" (hook), install ok
+    auto r = repair_one(task(), RepairPolicy{}, runner_of(f),
+                        [](const std::string&, const std::string&) {
+                            return true;    // verifier: really gone
+                        });
+
+    EXPECT_TRUE(r.healed);
+    EXPECT_EQ(r.rung, "reinstall");
+    ASSERT_EQ(f.ran.size(), 3u)
+        << "a non-zero exit from remove must not skip the reinstall";
+    EXPECT_EQ(f.ran[2], "xlings install linux-headers@5.11.1 -y");
+}
+
+// Same non-zero exit from remove, but the verifier says the record is still
+// there: reported as "still registered", never as a bare "could not be
+// removed" that hides whether the reinstall even ran.
+TEST(SelfRepairLadder, RemoveExitingNonZeroWithASurvivingRecordIsReportedByTheVerifier) {
+    FakeRunner f{.codes = {1, 1, 0}};   // install fails, remove "fails", install ok
+    auto r = repair_one(task(), RepairPolicy{}, runner_of(f),
+                        [](const std::string&, const std::string&) {
+                            return false;   // verifier: still registered
+                        });
 
     EXPECT_FALSE(r.healed);
-    EXPECT_EQ(r.rung, "none");
-    // Crucially: no second install. Reinstalling on top of a failed removal
-    // is how a half-removed release gets a second registration.
-    ASSERT_EQ(f.ran.size(), 2u);
+    ASSERT_EQ(f.ran.size(), 3u)
+        << "the reinstall must still be attempted regardless of remove's exit code";
+    EXPECT_NE(r.note.find("still registered"), std::string::npos) << r.note;
 }
 
 // ------------------------------------------------- destructive-rung gates
@@ -179,7 +205,7 @@ TEST(SelfRepairLadder, ReinstallsEvenWhenTheRecordSurvivedRemoval) {
                         });
 
     ASSERT_EQ(f.ran.size(), 3u) << "the package was removed and left out";
-    EXPECT_EQ(f.ran[1], "xlings remove linux-headers@5.11.1 -y");
+    EXPECT_EQ(f.ran[1], "xlings remove linux-headers@5.11.1 --force -y");
     EXPECT_EQ(f.ran[2], "xlings install linux-headers@5.11.1 -y");
     EXPECT_EQ(r.rung, "reinstall");
 }

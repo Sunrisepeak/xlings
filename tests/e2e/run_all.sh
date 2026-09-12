@@ -190,6 +190,10 @@ TESTS=(
     # what the synced index has already caught up with. Task 4 of the
     # 2026-09-12 robustness/usability round.
     "E2E-101|local_overlay_test.sh||"
+    # remove resolves against what is installed, withdraws state before the
+    # recipe's uninstall() runs, and --force/--all/--all-subos make "removed"
+    # mean removed no matter what shape the home is in (2026.9.12 Task 5).
+    "E2E-102|remove_force_contract_test.sh||"
 )
 
 # ── orphan check: a test that runs NOWHERE looks exactly like one that passes ──
