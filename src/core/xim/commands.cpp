@@ -1487,6 +1487,32 @@ int cmd_list(const std::string& filter, EventStream& stream, bool all) {
         : std::optional<std::string_view>{filter};
     auto installed = collect_inventory(catalog, all, inventoryFilter);
 
+    // `--all` walks every subos under the home; one that a hand-edit left
+    // unreadable is silently skipped by load_subos_snapshots() (see
+    // FindingKind::SubosUnreadable in `self doctor` for the same fact told in
+    // more detail) -- but a listing that just leaves it out, with no line
+    // saying so, reads as "that subos has nothing installed" instead of "we
+    // could not read it".
+    if (all) {
+        std::vector<std::string> unreadableSubos;
+        profile::load_subos_snapshots(Config::paths().homeDir, &unreadableSubos);
+        if (!unreadableSubos.empty()) {
+            std::string names;
+            for (const auto& n : unreadableSubos) {
+                if (!names.empty()) names += ", ";
+                names += n;
+            }
+            diag::emit({
+                .level   = diag::Level::Note,
+                .code    = "xim.subos_unreadable",
+                .summary = std::format(
+                    "{} subos could not be read and are not shown here: {}; "
+                    "see `xlings self doctor`",
+                    unreadableSubos.size(), names),
+            });
+        }
+    }
+
     if (installed.empty()) {
         if (all) {
             log::println("no installed packages found");

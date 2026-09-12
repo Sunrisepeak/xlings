@@ -154,7 +154,8 @@ rollback(const fs::path& envDir, int targetGen) {
     return packages;
 }
 
-std::vector<SubosSnapshot> load_subos_snapshots(const fs::path& xlingsHome) {
+std::vector<SubosSnapshot> load_subos_snapshots(const fs::path& xlingsHome,
+                                                 std::vector<std::string>* unreadable) {
     std::vector<SubosSnapshot> snapshots;
     auto subosDir = xlingsHome / "subos";
     std::error_code ec;
@@ -171,14 +172,22 @@ std::vector<SubosSnapshot> load_subos_snapshots(const fs::path& xlingsHome) {
         try {
             auto content = platform::read_file_to_string(wsPath.string());
             auto json = nlohmann::json::parse(content, nullptr, false);
-            if (json.is_discarded() || !json.is_object()) continue;
-            if (!json.contains("workspace") || !json["workspace"].is_object()) continue;
+            if (json.is_discarded() || !json.is_object()) {
+                if (unreadable) unreadable->push_back(name);
+                continue;
+            }
+            if (!json.contains("workspace") || !json["workspace"].is_object()) {
+                if (unreadable) unreadable->push_back(name);
+                continue;
+            }
             snapshots.push_back({
                 .name = name,
                 .dir = entry.path(),
                 .workspace = xvm::subos_workspace_from_json(json["workspace"]),
             });
-        } catch (...) {}
+        } catch (...) {
+            if (unreadable) unreadable->push_back(name);
+        }
     }
     std::ranges::sort(snapshots, [](const auto& a, const auto& b) {
         return a.name < b.name;
