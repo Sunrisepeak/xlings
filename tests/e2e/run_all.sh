@@ -202,6 +202,11 @@ TESTS=(
     # the user never has to `subos use` first; an unclaimed registration is
     # pruned rather than re-downloaded (D2).
     "E2E-104|doctor_cross_subos_fix_test.sh||"
+    # A registration rewrite (remove + reinstall of the same target@version)
+    # refreshes the sysroot of every subos that pins that version, not only
+    # the subos the command ran in -- and must not push the package into a
+    # subos that never had it (2026.9.12 Task 7, #586).
+    "E2E-105|sysroot_refresh_pinning_subos_test.sh||"
     # Four kinds of damage at once -- an unreadable subos, a DB entry for a
     # package never installed, a deleted overlay recipe file, and a real
     # package's xvm record pointed at a missing bin dir -- and a snapshot of
