@@ -275,4 +275,46 @@ log "S4: bystander (never installed) must still have no libfixture link"
 [[ ! -e "$LIB_BYSTANDER_DIR/libfixture.so.1" ]] \
   || fail "S4: the cross-subos refresh pushed libfixture into bystander, which never had it"
 
-log "PASS: a registration rewrite refreshes every subos pinning the version, not the ones that never asked"
+# ── Scenario 5: a corrupted pinning subos must not block the others,
+#    and must not crash the command that is refreshing them.
+#
+# `find_subos_pinning_version` (profile.cpp) is built on `load_subos_
+# snapshots`, which -- by design, per its own doc comment -- SKIPS a subos
+# whose `.xlings.json` fails to parse: "a subos whose config a user
+# hand-edited into invalid JSON must not take down an unrelated `remove`".
+# That means a subos with a broken state file is never even NAMED as
+# pinning anything, so it cannot reach the `log::warn` this review added --
+# confirmed empirically (built both binaries, corrupted `other`'s file
+# before a registration rewrite: the added-for-this-review warn line does
+# not fire, and `remove`'s own pre-existing "still referenced" check is
+# blind to it the same way, so `remove` did a full removal instead of a
+# detach). Widening that shared scan to surface unreadable files would
+# undo the exact guarantee its doc comment describes protecting, for a
+# second, unrelated caller (`xlings remove`'s pinned-by reporting) -- out
+# of scope for this fix, and the kind of change that trades one silent
+# failure for a different one.
+#
+# So this scenario tests what IS true and IS the point of "Required" in
+# the review even though the specific warn line is unreachable through
+# this path today: a broken subos must not block, corrupt, or widen the
+# blast radius of a registration rewrite happening elsewhere. `other` is
+# left exactly as it was (a stale/dangling link, silently, same as any
+# other command that consults `find_subos_pinning_version` today) while
+# `default` still gets refreshed correctly and `bystander` stays untouched.
+log "S5: a corrupted pinning subos's file must not block or crash the others' refresh"
+printf '{garbage' > "$OTHER_WS"
+rm -f "$MARKER_FILE"
+rm -rf "$PAYLOAD_DIR"
+RUN_IN default remove libfixture -y \
+  > "$RUNTIME_DIR/remove-default-2.log" 2>&1 \
+  || { cat "$RUNTIME_DIR/remove-default-2.log"; fail "S5: remove in default failed"; }
+RUN_IN default install libfixture@1.0.0 -u -y \
+  > "$RUNTIME_DIR/install-default-3.log" 2>&1 \
+  || { cat "$RUNTIME_DIR/install-default-3.log"; fail "S5: reinstall in default failed"; }
+
+[[ "$(lib_gen "$LIB_DEFAULT")" == "gen1" ]] \
+  || fail "S5: default's own sysroot did not follow this second registration rewrite -- a corrupted OTHER subos must not block it"
+[[ ! -e "$LIB_BYSTANDER_DIR/libfixture.so.1" ]] \
+  || fail "S5: bystander must still have nothing after a rewrite that ran alongside a corrupted subos"
+
+log "PASS: a registration rewrite refreshes every subos pinning the version, not the ones that never asked, and a broken subos cannot block or widen that"

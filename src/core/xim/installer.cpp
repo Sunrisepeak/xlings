@@ -1248,6 +1248,31 @@ xvm::SubosWorkspace load_workspace_file_(const std::filesystem::path& path) {
     }
 }
 
+// Same read as `load_workspace_file_`, but distinguishes "read fine, and
+// the workspace is genuinely empty" from "could not be read" -- a
+// difference `load_workspace_file_`'s callers so far never needed to see
+// (a missing state file for a subos nobody has referenced yet is a normal
+// empty workspace to them, not a fault). A caller that already has other
+// evidence this file OUGHT to contain something (its own separate scan
+// found this exact subos pinning a version) needs the distinction: nullopt
+// says "do not trust the empty result you would otherwise get", where the
+// plain function above cannot tell its caller that.
+std::optional<xvm::SubosWorkspace>
+load_workspace_file_checked_(const std::filesystem::path& path) {
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) return std::nullopt;
+    try {
+        auto content = platform::read_file_to_string(path.string());
+        auto json = nlohmann::json::parse(content, nullptr, false);
+        if (json.is_discarded() || !json.is_object()) return std::nullopt;
+        if (!json.contains("workspace") || !json["workspace"].is_object())
+            return std::nullopt;
+        return xvm::subos_workspace_from_json(json["workspace"]);
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
 std::vector<std::filesystem::path> workspace_config_paths_for_scope_(PackageScope scope) {
     namespace fs = std::filesystem;
     (void)scope;
@@ -1968,13 +1993,11 @@ bool process_xvm_operations_(const PlanNode& node,
     // `scopedDb` (the version DB), `xlings_bin` and `shim_ext` stay captured
     // from the enclosing scope -- they describe the shared payload store and
     // the one home-level entry binary, neither of which is per-subos.
-    // `wsi` is accepted for symmetry with the per-subos state the caller
-    // passes (`Config::workspace_installed()`); no effect kind placed here
-    // needs it today.
+    // No `installed[]` parameter: no effect kind placed here needs it,
+    // unlike the caller's own per-subos state (`Config::workspace_
+    // installed()`), which activation elsewhere in this function does read.
     auto place_effects_into = [&](const std::filesystem::path& subosDir,
-                                   const xvm::Workspace& ws,
-                                   const xvm::WorkspaceInstalled& wsi) {
-        (void)wsi;
+                                   const xvm::Workspace& ws) {
         const auto binDir = subosDir / "bin";
         const auto libDir = subosDir / "lib";
         const auto includeDir = subosDir / "usr" / "include";
@@ -2134,7 +2157,7 @@ bool process_xvm_operations_(const PlanNode& node,
         }
     };
 
-    place_effects_into(artifactSubosDir, scopedWorkspace, scopedInstalled);
+    place_effects_into(artifactSubosDir, scopedWorkspace);
 
     // A registration rewrite (e.g. `remove` + `install` for the same
     // version, or a recipe update that changes a release's declared paths)
@@ -2169,8 +2192,30 @@ bool process_xvm_operations_(const PlanNode& node,
         if (otherSubos == Config::paths().activeSubos) continue;
         const auto otherSubosDir =
             Config::paths().homeDir / "subos" / otherSubos;
-        auto sws = load_workspace_file_(otherSubosDir / ".xlings.json");
-        place_effects_into(otherSubosDir, sws.active, sws.installed);
+        const auto otherSubosConfig = otherSubosDir / ".xlings.json";
+        auto sws = load_workspace_file_checked_(otherSubosConfig);
+        if (!sws) {
+            // `find_subos_pinning_version` just said this subos pins
+            // `node.name`@`node.version`, which only happens by reading a
+            // valid workspace object out of this exact file -- so a failure
+            // reading it again here, moments later, means the file is
+            // unreadable (missing, truncated, invalid JSON), not that the
+            // subos legitimately has an empty workspace. Silently
+            // continuing would leave that subos's sysroot on whatever it
+            // pointed at before -- possibly dangling, per #586 -- with
+            // nothing in the log to say so. `self doctor --subos <name>`
+            // is the same repair `xlings remove`'s cross-subos reporting
+            // already points at for a broken payload; it lands in this
+            // same release.
+            log::warn(
+                "{}: pins {}@{}, but its workspace file could not be read "
+                "({}) -- its sysroot was not refreshed; run `xlings self "
+                "doctor --subos {}` to repair it",
+                otherSubos, node.name, node.version,
+                otherSubosConfig.string(), otherSubos);
+            continue;
+        }
+        place_effects_into(otherSubosDir, sws->active);
     }
 
     cleanup_removed_xvm_program_artifacts(
