@@ -142,6 +142,12 @@ run_capture default self doctor --fix
   || fail "I3: --fix should have repaired the payload via the cross-subos walk:\n$out"
 has_ws_entry "$WS_OTHER" "xsf-plain" \
   || fail "I3: the repair must land in 'other's own workspace"
+# Smoke, not a contract on rc (I5 below covers the failure shape with a
+# hand-crafted subos instead): a REAL child subprocess for 'other' must
+# actually be invoked, not just imagined by the plan — the announce line
+# names it.
+grep -q "repairing subos other" <<<"$out" \
+  || fail "I3: expected the cross-subos walk to announce running the 'other' child; got:\n$out"
 
 log "I3: a second --fix --dry-run has nothing left to plan for this entry"
 run_capture default self doctor --fix --dry-run
@@ -180,39 +186,40 @@ grep -q "prune xsf-plain@9\.9\.9" <<<"$out" \
 grep -qE "would run .*install xsf-plain@9\.9\.9" <<<"$out" \
   && fail "I9: the unclaimed entry must not be queued for reinstall; got:\n$out"
 
-# ── I5: a genuinely FAILING cross-subos child fails the whole run ────────
+# ── I5: an owning subos whose NAME is not a safe shell token fails the
+#        whole run, and is never actually shelled out to ──────────────────
 #
-# Its own home, separate from I3/I9's -- this scenario is designed to end
-# with 'other' still broken (the child never gets a chance to succeed), and
-# must not leave that behind for the scenarios above to trip over.
+# Its own home, separate from I3/I9's.
 #
-# 'other's subos directory is made read-only, so when `default`'s --fix
-# shells into it (`self doctor --fix --subos other`), that child's own
-# reinstall of xsf-plain can create the payload file (install() writes
-# under data/, untouched by the read-only directory) but cannot write its
-# own workspace to register it (config()'s `xvm.add` targets
-# subos/other/.xlings.json) -- so the child's `xlings install` genuinely
-# fails (non-zero), not "succeeds but didn't really fix it": a real,
-# observable subprocess failure the child's own re-detect still finds
-# broken afterward, which is what makes this deterministic rather than a
-# race against however fast some prune or ladder rung reacts.
+# This used to break 'other's subos directory read-only, so the child's
+# `self doctor --fix --subos other` could write the payload but not its
+# own workspace, and genuinely exited non-zero. Task 5's repair ladder
+# changed that mechanism's outcome: `remove --force` then reinstall now
+# WITHDRAWS the broken registration before the read-only directory ever
+# gets a chance to block a write; the reinstall then fails as before, but
+# re-detection finds no entry left to be broken at all, and a pruned entry
+# with nothing left to find is doctor's pre-existing, intentional "not
+# outstanding" case -- so the parent came back 0. That read-only trick is
+# no longer a deterministic child failure; it is a race against whichever
+# rung of the ladder reacts first, decided in favor of the ladder now.
 #
-# Two mechanisms were tried and rejected before this one: a recipe absent
-# from the index (or present only for another platform) makes
-# owning_coordinate_ return no remedy, which repair_payloads_ prunes
-# unconditionally regardless of subos ownership -- converges cleanly, no
-# failure to observe. A recipe whose install() hook always returns false
-# DOES make `xlings install` exit non-zero, but the installer tags that
-# payload's `.xpkg-install.json` `incomplete: true`, which reclassifies the
-# finding from BrokenPayload to IncompletePayload on re-detect --
-# `stillFound` (below, and the pre-existing analogous check inside the
-# CHILD's own cmd_doctor) only looks at BrokenPayload/ForeignPayload, so the
-# child's OWN outstanding count comes out 0 and it stamps verifiedBy anyway
-# despite returning 1. That is a real, separate gap (IncompletePayload does
-# not gate `outstanding`), not something this scenario is testing -- if this
-# mechanism ever needs to change, keep re-detection landing on BrokenPayload,
-# not IncompletePayload, or this assertion block will need it fixed first.
-log "I5: a failing cross-subos child fails the whole run and withholds the stamp"
+# This scenario keeps doctor's exit semantics for THAT case unchanged (a
+# pruned, unclaimed entry is not outstanding -- see the note in the report
+# it prints) and reaches the shape I5 actually needs a different way: a
+# subos directory created BY HAND (not through `xlings subos new`, which
+# -- like the CLI's own flag parser -- would never let a name like this
+# through) whose NAME fails `is_shell_safe_token` (leading '-'), with a
+# workspace claiming the broken payload's exact target@version, the same
+# way a genuine owning subos's file would. The scan attributes the
+# ForeignPayload finding to it, and `repair_other_subos_walk_`'s existing
+# guard -- the same shell-safety check every other shelled-out value in
+# doctor.cpp gets -- refuses to run a subprocess for it: the name goes
+# straight into `failedSubos` with a hand-run remedy, never executed. No
+# subprocess, no race, no read-only directory: deterministic by
+# construction, and it still exercises exactly the contract I5 is about --
+# a subos this run cannot repair must fail the parent and withhold the
+# stamp rather than be silently skipped.
+log "I5: an unsafe-named owning subos is reported and gates the stamp, but is never executed"
 HOME5="$RUNTIME_DIR/i5-home"
 mkdir -p "$HOME5/subos/default/bin"
 cp "$XLINGS_BIN" "$HOME5/xlings"
@@ -229,31 +236,58 @@ RUN5() {
 RUN5 default self init >/dev/null 2>&1 || fail "I5 setup: self init failed"
 mkdir -p "$HOME5/data/xim-index-repos"
 printf '{}\n' > "$HOME5/data/xim-index-repos/xim-indexrepos.json"
-RUN5 default subos new other >/dev/null 2>&1 || fail "I5 setup: subos new other failed"
-RUN5 other install xsf-plain@1.0.0 -y >/dev/null 2>&1 \
-  || fail "I5 setup: other install xsf-plain failed"
+RUN5 default install xsf-plain@1.0.0 -y >/dev/null 2>&1 \
+  || fail "I5 setup: default install xsf-plain failed"
 
 PAYLOAD5="$HOME5/data/xpkgs/xim-x-xsf-plain/1.0.0"
+WS_DEFAULT5="$HOME5/subos/default/.xlings.json"
 [[ -d "$PAYLOAD5" ]] || fail "I5 setup: payload should exist before breaking it"
+
+# Strip default's OWN claim on the target: ownership must resolve entirely
+# to the hand-crafted subos below, not to this (current, safe-named) one --
+# default has to see this as a ForeignPayload it does not own itself,
+# exactly the shape repair_other_subos_walk_ exists for. The shared
+# versions DB lives in $HOME5/.xlings.json, untouched by this edit to
+# default's own subos-scoped workspace file.
+python3 - "$WS_DEFAULT5" <<'PY'
+import json, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+data = json.loads(p.read_text())
+data.get("workspace", {}).pop("xsf-plain", None)
+p.write_text(json.dumps(data))
+PY
+
 rm -rf "$PAYLOAD5"
-chmod -R a-w "$HOME5/subos/other"
+
+mkdir -p "$HOME5/subos/-bad"
+cat > "$HOME5/subos/-bad/.xlings.json" <<JSON
+{ "workspace": { "xsf-plain": "1.0.0" } }
+JSON
 
 i5_rc=0
 i5_out=$(RUN5 default self doctor --fix 2>&1) || i5_rc=$?
-chmod -R u+w "$HOME5/subos/other"
 
 [[ $i5_rc -eq 1 ]] \
-  || fail "I5: a failed cross-subos child must fail the parent's run; got rc=$i5_rc:\n$i5_out"
-grep -q "subos 'other'" <<<"$i5_out" \
-  || fail "I5: the report must name the failed subos; got:\n$i5_out"
-grep -qE "self doctor --fix --subos other.*exited [1-9][0-9]*" <<<"$i5_out" \
-  || fail "I5: the report must show the exact child command and that it failed; got:\n$i5_out"
+  || fail "I5: an unsafe-named owning subos must fail the parent's run; got rc=$i5_rc:\n$i5_out"
+grep -q -- "-bad" <<<"$i5_out" \
+  || fail "I5: the report must name the offending subos '-bad'; got:\n$i5_out"
+grep -qi "not a safe shell token" <<<"$i5_out" \
+  || fail "I5: the report must say it was never run (unsafe name), not that it failed; got:\n$i5_out"
+grep -q -- "--subos -bad" <<<"$i5_out" \
+  && fail "I5: an unsafe subos name must never actually be shelled out to; got:\n$i5_out"
 
 i5_verified=$(python3 -c "
 import json, pathlib
 print(json.loads(pathlib.Path('$HOME5/.xlings.json').read_text()).get('verifiedBy', ''))
 ")
 [[ -z "$i5_verified" ]] \
-  || fail "I5: verifiedBy must not be written while a cross-subos child failed; got '$i5_verified'"
+  || fail "I5: verifiedBy must not be written while an owning subos could not be repaired; got '$i5_verified'"
+
+# The separate, non-asserting-on-rc smoke that a REAL child subprocess for a
+# genuinely reachable owning subos still runs (so the subprocess path stays
+# covered, not just the unsafe-name skip path) lives in I3 above -- it
+# already exercises `self doctor --fix` repairing 'other' for real and
+# asserts the "repairing subos other" announce line appears, without this
+# scenario's `-bad` entry anywhere nearby to conflate the two.
 
 log "PASS: doctor_cross_subos_fix"

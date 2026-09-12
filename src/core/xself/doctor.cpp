@@ -5161,7 +5161,17 @@ int cmd_doctor(EventStream& stream, bool fix, bool resetMetadata, bool dryRun, b
     std::set<std::pair<std::string, std::string>> stillFound;
     for (const auto& f : scan.findings) {
         if (f.kind == FindingKind::BrokenPayload
-            || f.kind == FindingKind::ForeignPayload) {
+            || f.kind == FindingKind::ForeignPayload
+            // An IncompletePayload finding is an Error-level finding
+            // `repair_incomplete_` explicitly tried to fix by re-running
+            // install() (see its own comment). If the reinstall failed, the
+            // marker is still on disk and this finding is re-detected by
+            // `refresh()` the same as before the ladder ran -- so it must
+            // gate the stamp/exit code exactly like a still-broken payload
+            // does. Before this, a home whose ONLY remaining defect was a
+            // failed reinstall could stamp `verifiedBy` and exit 0 while
+            // install() had never actually succeeded.
+            || f.kind == FindingKind::IncompletePayload) {
             stillFound.emplace(f.target, f.version);
         }
     }
