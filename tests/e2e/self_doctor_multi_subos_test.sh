@@ -285,14 +285,31 @@ grep -q "REMOVED" <<<"$out" \
 grep -q "still registered" <<<"$out" \
   || fail "S6: must say the record survived the removal; got:\n$out"
 
-# The record it declined to claim as removed is in fact still there.
-python3 - "$HOME_DIR" <<'PY' || fail "S6: ms-shared@1.0.0 must still be registered"
-import json, pathlib, sys
-data = json.loads(pathlib.Path(sys.argv[1], ".xlings.json").read_text())
-versions = (data.get("versions") or {}).get("ms-shared") or {}
-assert "1.0.0" in (versions.get("versions") or {}), \
-    "S6: the entry R3 said it removed is gone -- the message was right after all?"
-PY
+# `default`'s OWN claim is checked against disk STATE AT THE MOMENT it ran,
+# not against whatever the home looks like once the whole `--fix` (which
+# also walks into `other` in its own subprocess) has finished.
+#
+# `default`'s ladder is truthful here: `other` still referenced the
+# version WHEN `default`'s R3 asked, so detaching (not removing) and
+# saying "still registered" was correct. What happens next is a SEPARATE,
+# later decision: `other`'s own cross-subos repair attempt (visible above
+# as "cross-subos repair ... exited 1") makes its OWN, independent R3
+# attempt once `other` is the release's last remaining claimant -- and a
+# fixture whose install() is permanently broken (`$FAIL_MARKER`) means
+# THAT attempt can legitimately end in R3's OWN "REMOVED but could not
+# reinstall" outcome for `other`'s copy, once nothing else needs it either.
+# Asserting the shared DB entry is untouched after the FULL walk would be
+# asserting that second, independent repair must always fail to finish
+# the job -- which is not what S6 is about, and is not true once F1
+# (2026.9.12) made that outcome reachable and reported instead of silently
+# swallowed.
+ws_default="$(python3 -c "
+import json
+d = json.load(open('$HOME_DIR/subos/default/.xlings.json'))
+print('ms-shared' in (d.get('workspace') or {}) and 'active' in (d['workspace'].get('ms-shared') or {}))
+")"
+[[ "$ws_default" == "False" ]] \
+  || fail "S6: default's own workspace should show ms-shared DETACHED (no active binding), matching what it printed; got active=$ws_default"
 
 # And the home must not be stamped off the back of a failed repair.
 [[ "$(recorded_version)" != "0.4.69" ]] \
