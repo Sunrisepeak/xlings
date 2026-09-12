@@ -111,3 +111,13 @@ capi.lua = "0.0.3"
 
 [dev-dependencies]
 gtest = "1.15.2"
+
+# Sanitizer profile for CI (`mcpp test --profile asan`). Not a default: the
+# instrumented build is several times slower and only the unit suite runs
+# under it. Issue #433: a use-after-free reached three releases undetected
+# because nothing ever ran the tests instrumented.
+[profile.asan]
+opt      = 1
+debug    = true
+cxxflags = ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
+ldflags  = ["-fsanitize=address,undefined"]
