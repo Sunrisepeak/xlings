@@ -181,8 +181,16 @@ RUN install doctor-fixture@1.0.0 -y >/dev/null 2>&1 \
 RUN use doctor-fixture 1.0.0 >/dev/null 2>&1 || fail "reset: use failed"
 [[ -e "$SHIM" ]] || fail "reset: shim should exist after re-install"
 
-# ── S7: quick keeps the finding; deep resolves the package remedy ─────
-log "S7: rm active payload → quick reports it without deep remedy resolution"
+# ── S7: quick and deep resolve the same package remedy (D1) ───────────
+#
+# Until D1 (2026.9.12.1), the remedy lookup was gated on `--deep`/`--fix`, so
+# a plain `self doctor` reported a broken payload the index could plainly
+# fix without ever saying how -- and once no remedy printed, it read as "no
+# package provides this". The catalog lookup itself is cheap (a local index
+# read, not a network fetch); only the payload WALK was ever the expensive
+# part `--deep` gates, and this scenario is exactly the case that walk is
+# not needed for -- the payload directory is already known gone.
+log "S7: rm active payload → quick and deep report the same remedy"
 PAYLOAD_DIR="$HOME_DIR/data/xpkgs/xim-x-doctor-fixture/1.0.0"
 [[ -d "$PAYLOAD_DIR" ]] || fail "S7 setup: payload dir should exist"
 rm -rf "$PAYLOAD_DIR"
@@ -194,15 +202,15 @@ echo "$out" | grep -q "broken payload" \
   || fail "S7: output should mention 'broken payload'; got:\n$out"
 echo "$out" | grep -q "active" \
   || fail "S7: output should mark active version with [active] tag"
+# The remedy names the PACKAGE, with its namespace, because that is what
+# `xlings install` takes -- a finding names an xvm target and those are not the
+# same thing (`nm@20.1.7` is a program llvm registers, not a package).
 echo "$out" | grep -qE "xlings install (xim:)?doctor-fixture@1\.0\.0" \
-  && fail "S7: quick doctor must not resolve package remedies; got:\n$out"
+  || fail "S7: quick doctor should already resolve the package remedy; got:\n$out"
 
 rc=0
 out=$(RUN self doctor --deep 2>&1) || rc=$?
 [[ $rc -ne 0 ]] || fail "S7: deep doctor should still report the broken payload"
-# The remedy names the PACKAGE, with its namespace, because that is what
-# `xlings install` takes -- a finding names an xvm target and those are not the
-# same thing (`nm@20.1.7` is a program llvm registers, not a package).
 echo "$out" | grep -qE "xlings install (xim:)?doctor-fixture@1\.0\.0" \
   || fail "S7: output should include the remediation command; got:\n$out"
 

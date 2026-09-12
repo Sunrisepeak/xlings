@@ -7,14 +7,19 @@
 # and repairs only in the second, and until this test nothing pinned what
 # happens where. Measured consequences, each an assertion below:
 #
-#   S2  a broken payload only another subos uses was repaired HERE, which
-#       registered that package into THIS subos's workspace, shims and
-#       sysroot. The user asked to fix their own environment.
-#   S3  the migration marker lives in the HOME config while the repair
-#       happens in ONE subos, so fixing the first subos stamped the whole
-#       home as migrated and the rest never saw the hint again.
-#   S4  fixing the last outstanding subos must land the stamp -- otherwise
-#       the gate above just moves the nag from "too early" to "forever".
+#   S2  a broken payload only another subos uses is reported here, but
+#       never adopted -- it must not register into THIS subos's workspace,
+#       shims or sysroot, and plain `self doctor` (no --fix) must not repair
+#       anything on its own.
+#   S3  since Task 6 (2026.9.12.1), ONE `--fix` from `default` repairs it,
+#       by walking into 'other' in its own subprocess (`self doctor --fix
+#       --subos other`) rather than requiring `xlings subos use other`
+#       first -- the payload lands back on disk in 'other's own state, and
+#       the migration marker (verifiedBy, HOME-level) lands immediately
+#       because nothing is outstanding anywhere any more.
+#   S4  a second `--fix` is a no-op: an empty plan, exit 0, verifiedBy
+#       unchanged -- the cross-subos walk itself must converge, not
+#       re-announce a repair or re-shell into 'other' every run.
 #   S5  a subos pointing at a version the shared DB no longer has was
 #       invisible from everywhere except that subos.
 #   S6  R3 reads `xlings remove` exiting 0 as "the record is gone". On a
@@ -124,22 +129,26 @@ WS_OTHER="$HOME_DIR/subos/other/.xlings.json"
 PAYLOAD_B="$HOME_DIR/data/xpkgs/xim-x-ms-only-b/1.0.0"
 PAYLOAD_SHARED="$HOME_DIR/data/xpkgs/xim-x-ms-shared/1.0.0"
 
-# Record an older client into the home config, the way an upgraded home reads.
-# Without this the migration-marker assertions would be vacuous: a fresh home
-# already carries the running version, so "the stamp did not land" and "the
-# stamp landed" look identical.
+# Record a stale verification into the home config, the way a home an older
+# client last confirmed reads. `.xlings.json:verifiedBy` -- not `:version`,
+# which `self install`/`self update` move on every upgrade whether or not
+# anything was ever checked -- is what cmd_doctor's stamp gate reads and
+# writes (see Config::record_verified_version). Without this the
+# migration-marker assertions below would be vacuous: a fresh home's
+# `verifiedBy` is already unset, so "the stamp did not land" and "the stamp
+# landed" would look identical the moment doctor writes it once.
 python3 - "$HOME_DIR" <<'PY'
 import json, pathlib, sys
 p = pathlib.Path(sys.argv[1], ".xlings.json")
 data = json.loads(p.read_text())
-data["version"] = "0.4.69"
+data["verifiedBy"] = "0.4.69"
 p.write_text(json.dumps(data, indent=2))
 PY
 
 recorded_version() {
   python3 - "$HOME_DIR" <<'PY'
 import json, pathlib, sys
-print(json.loads(pathlib.Path(sys.argv[1], ".xlings.json").read_text()).get("version", ""))
+print(json.loads(pathlib.Path(sys.argv[1], ".xlings.json").read_text()).get("verifiedBy", ""))
 PY
 }
 has_ws_entry() {
@@ -183,28 +192,44 @@ grep -q "xlings subos use other" <<<"$out" \
 [[ $rc -eq 0 ]] \
   || fail "S2: another subos's broken payload must not fail this subos (rc=$rc):\n$out"
 
-log "S2b: --fix in default must not adopt the package"
+log "S3: --fix in default repairs it in 'other' via a subprocess, without adopting it here"
 run_capture default self doctor --fix
+[[ $rc -eq 0 ]] || fail "S3: default's --fix should exit 0; got $rc:\n$out"
 has_ws_entry "$WS_DEFAULT" "ms-only-b" \
-  && fail "S2b: --fix pulled ms-only-b into default's workspace:\n$out"
-[[ ! -d "$PAYLOAD_B" ]] \
-  || fail "S2b: default's --fix must not reinstall another subos's package"
+  && fail "S3: --fix pulled ms-only-b into default's OWN workspace:\n$out"
 [[ ! -e "$HOME_DIR/subos/default/bin/ms-only-b" ]] \
-  || fail "S2b: default's --fix must not create a shim for another subos's package"
-
-# ── S3: the migration marker must not land while another subos is behind ──
-log "S3: stamp withheld while another subos still has a repair outstanding"
-[[ "$(recorded_version)" == "0.4.69" ]] \
-  || fail "S3: --fix stamped the home while 'other' still had work outstanding"
-
-# ── S4: repairing it in `other` lands the stamp ──────────────────────
-log "S4: --fix in other repairs the payload and lands the stamp"
-run_capture other self doctor --fix
-[[ $rc -eq 0 ]] || fail "S4: other's --fix should exit 0; got $rc:\n$out"
+  || fail "S3: default's --fix must not create a shim for another subos's package HERE"
+# The cross-subos walk (Task 6, 2026.9.12.1): default's own --fix reaches
+# into 'other' with a subprocess (`self doctor --fix --subos other`) rather
+# than requiring the user to `xlings subos use other` by hand first.
+grep -qi "repairing subos other" <<<"$out" \
+  || fail "S3: default's --fix should announce the cross-subos repair:\n$out"
+# The payload really is back on disk in 'other' -- not just an exit code.
 [[ -f "$PAYLOAD_B/bin/ms-only-b" ]] \
-  || fail "S4: other's --fix must restore the payload it owns"
+  || fail "S3: default's --fix should have repaired the payload via the cross-subos walk:\n$out"
+has_ws_entry "$WS_OTHER" "ms-only-b" \
+  || fail "S3: the repair must land in 'other's own workspace, not default's"
 [[ "$(recorded_version)" != "0.4.69" ]] \
-  || fail "S4: stamp must land once nothing is outstanding anywhere"
+  || fail "S3: default's --fix repaired 'other' via the cross-subos walk, but verifiedBy did not land:\n$out"
+
+# ── S4: a second --fix is a no-op -- empty plan, exit 0, verifiedBy
+#        unchanged. This is convergence of the cross-subos WALK itself: a
+#        run that finds no ForeignPayload/OtherSubos finding left must not
+#        re-announce a repair or re-shell into 'other'. ──────────────────
+log "S4: a second --fix from default is a no-op"
+landed_after_s3="$(recorded_version)"
+run_capture default self doctor --fix --dry-run
+[[ $rc -eq 0 ]] \
+  || fail "S4: a converged home's --fix --dry-run should exit 0; got $rc:\n$out"
+grep -qi "would run" <<<"$out" \
+  && fail "S4: nothing should be left to plan after S3 converged; got:\n$out"
+[[ "$(recorded_version)" == "$landed_after_s3" ]] \
+  || fail "S4: a no-op --dry-run must not change verifiedBy"
+
+run_capture other self doctor --fix
+[[ $rc -eq 0 ]] || fail "S4: other's own --fix should also be a no-op; got $rc:\n$out"
+[[ -f "$PAYLOAD_B/bin/ms-only-b" ]] \
+  || fail "S4: the payload other owns must still be present"
 
 RUN_IN default self doctor >/dev/null 2>&1 \
   || fail "S4: default should be clean again after other repaired its payload"

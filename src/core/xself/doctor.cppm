@@ -330,12 +330,31 @@ struct Finding {
     // one separately buries everything else.
     std::string  groupKey;
     bool         active { false };
+    // BrokenPayload only: no subos anywhere -- not this one, not any other
+    // (see `subos::ownership`) -- claims this (target, version), and it is
+    // not this subos's active pick either. Nothing would ever run it again.
+    //
+    // Distinct from `remedy` being empty: a package this catalog cannot
+    // resolve is unclaimed AND remedy-less, but plenty of unclaimed entries
+    // resolve fine -- an old mcpp release the index still ships, that no
+    // subos still points at. For THOSE the remedy stays printed (it is a
+    // true fact: running it brings the entry back), while `--fix` prunes
+    // the registration instead of paying for the download. See
+    // repair_payloads_.
+    bool         unclaimed { false };
     std::vector<std::string> subos;
     fs::path     shimPath;      // shim-layer findings only
 };
 
 struct Scan {
     std::vector<Finding> findings;
+    // Whether a package catalog was available to answer "does anything
+    // provide this entry" when this scan ran. False is "unknown", not "no" --
+    // a remedy-less BrokenPayload finding must say the index could not be
+    // consulted rather than implying no package exists, and the two read as
+    // the same thing (`remedy.empty()`) to everything downstream of
+    // detection. See render_'s "no remedy" branch.
+    bool probeAvailable { false };
 };
 
 // Everything detection reads. Rebuilt from disk between passes, because the
@@ -391,6 +410,14 @@ struct AuditSelection {
     // `--deep` (one pass) wants, and what every test that has not opted in
     // gets.
     elfcheck::PayloadScanCache* payloadCache { nullptr };
+
+    // Whether cmd_doctor built a package catalog for this scan. Threaded in
+    // rather than inferred from CoordinateProbe's answer, because the probe
+    // returns `false` both when the catalog is missing and when it is
+    // present and genuinely has nothing -- the two need different words in
+    // the report (see Scan::probeAvailable) and only the caller that built
+    // (or didn't build) the catalog knows which.
+    bool probeAvailable { false };
 
     // What the payload audit actually covered, reported when it finishes.
     //
@@ -501,8 +528,9 @@ struct Counts {
 export int cmd_doctor(EventStream& stream, bool fix,
                       bool resetMetadata = false,
                       bool dryRun = false,
-                      bool verbose = false,
+                      bool showOk = false,
                       bool deep = false,
-                      std::optional<std::string> scope = std::nullopt);
+                      std::optional<std::string> scope = std::nullopt,
+                      std::optional<std::string> subos = std::nullopt);
 
 } // namespace xlings::xself
