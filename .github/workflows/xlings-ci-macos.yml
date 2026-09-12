@@ -366,6 +366,21 @@ jobs:
       - name: SubOS sandbox command contract
         run: bash tests/e2e/subos_cmd_contract_test.sh
 
+      - name: Platform core contract
+        # 2026-09-12 robustness/usability round: the four new bash e2e
+        # contracts that don't need a whole subos rebuild to be meaningful
+        # on macOS. Two names below (doctor_cross_subos_fix_test.sh here,
+        # and separately sysroot_refresh_pinning_subos_test.sh which this
+        # step intentionally does NOT run) live on sibling branches of this
+        # same round not yet merged into this one -- referenced by name on
+        # purpose so this step starts exercising them the moment that merge
+        # lands, rather than needing a second PR to remember to add them.
+        run: |
+          bash tests/e2e/notice_once_test.sh
+          bash tests/e2e/remove_force_contract_test.sh
+          bash tests/e2e/doctor_cross_subos_fix_test.sh
+          bash tests/e2e/broken_home_isolation_test.sh
+
       - name: Fresh XLINGS_HOME first install
         run: bash tests/e2e/fresh_xlings_home_install_test.sh
 
