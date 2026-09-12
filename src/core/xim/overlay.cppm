@@ -61,7 +61,14 @@ struct RepoDir {
 };
 
 struct Status {
-    enum Kind { Unique, Identical, Modified, Behind } kind = Unique;
+    // Missing: a TRACKED entry (`.overlay.json` has a record) whose file is
+    // no longer on disk -- `load_with_files` still yields a `DiscoveredEntry`
+    // for it (its `path` is `recipe_path(dir, name)` unconditionally), so
+    // without this case `status_of` degraded to Unique off an empty sha,
+    // which then made `--list-xpkg` claim "unique" for a recipe that does
+    // not exist. An UNTRACKED entry can never be Missing: `load_with_files`
+    // only synthesizes one by scanning files that are actually there.
+    enum Kind { Unique, Identical, Modified, Behind, Missing } kind = Unique;
     std::string upstreamRepo;
     std::string upstreamVersion;
 };
@@ -106,6 +113,15 @@ void save(const std::filesystem::path& dir,
 // read fresh from the file. A file already covered by a tracked entry is
 // not duplicated. Order is unspecified; sort by `entry.name` for display.
 std::vector<DiscoveredEntry> load_with_files(const std::filesystem::path& dir);
+
+// Finds the entry named `name` in a `load_with_files` result, tracked or
+// not. The lookup `--remove-xpkg` needs to reach an untracked overlay
+// recipe that `recipe_path(dir, name)` alone cannot: an untracked entry's
+// real on-disk file may not live where that letter-bucket formula would
+// put it (see `DiscoveredEntry`'s own comment on why `path` is never
+// recomputed from the name for those).
+std::optional<DiscoveredEntry> find_entry(
+    std::span<const DiscoveredEntry> discovered, std::string_view name);
 
 // Lowercase hex sha256 of a file's bytes; "" if it can't be read.
 std::string file_sha256(const std::filesystem::path& path);

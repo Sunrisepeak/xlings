@@ -255,6 +255,68 @@ TEST_F(OverlayStatusTest, NoRecordedVersionNeverReportsBehind) {
     EXPECT_EQ(status.kind, overlay::Status::Modified);
 }
 
+TEST_F(OverlayStatusTest, MissingWhenFileIsGone) {
+    // A TRACKED entry (`.overlay.json` has a record) whose file was deleted
+    // out from under it -- `load_with_files` still yields a `DiscoveredEntry`
+    // for this (path is `recipe_path(dir, name)` unconditionally), so
+    // without a dedicated Kind this degraded to Unique off an empty sha.
+    overlay::Entry entry{.name = "ghost", .version = "1.0.0"};
+    auto status = overlay::status_of(
+        entry, overlay::recipe_path(overlayDir_, "ghost"), candidates("ghost"));
+    EXPECT_EQ(status.kind, overlay::Status::Missing);
+}
+
+TEST_F(OverlayStatusTest, MissingOutranksUpstreamComparisons) {
+    // Even when an upstream candidate exists and declares a newer version
+    // (what would otherwise classify as Behind), a gone local file must
+    // still report Missing -- there is nothing on disk to compare.
+    write_recipe(upstreamDir_, "ghost", "2.0.0");
+    overlay::Entry entry{.name = "ghost", .version = "1.0.0"};
+    auto status = overlay::status_of(
+        entry, overlay::recipe_path(overlayDir_, "ghost"), candidates("ghost"));
+    EXPECT_EQ(status.kind, overlay::Status::Missing);
+}
+
+// ── find_entry ────────────────────────────────────────────────────────
+
+TEST(OverlayFindEntry, FindsATrackedEntryByName) {
+    auto root = make_temp_dir("find-tracked");
+    write_recipe(root, "alpha", "1.0.0");
+    std::map<std::string, overlay::Entry> entries;
+    entries["alpha"] = {.name = "alpha", .version = "1.0.0"};
+    overlay::save(root, entries);
+
+    auto discovered = overlay::load_with_files(root);
+    auto found = overlay::find_entry(discovered, "alpha");
+    ASSERT_TRUE(found.has_value());
+    EXPECT_TRUE(found->tracked);
+    EXPECT_EQ(found->entry.name, "alpha");
+    fs::remove_all(root);
+}
+
+TEST(OverlayFindEntry, FindsAnUntrackedEntryByName) {
+    // The exact case `--remove-xpkg` on an untracked overlay recipe needs:
+    // no `.overlay.json` record at all, only a file on disk.
+    auto root = make_temp_dir("find-untracked");
+    write_recipe(root, "beta", "1.0.0");
+
+    auto discovered = overlay::load_with_files(root);
+    auto found = overlay::find_entry(discovered, "beta");
+    ASSERT_TRUE(found.has_value());
+    EXPECT_FALSE(found->tracked);
+    EXPECT_EQ(found->entry.name, "beta");
+    fs::remove_all(root);
+}
+
+TEST(OverlayFindEntry, NulloptWhenNameIsNotThere) {
+    auto root = make_temp_dir("find-missing");
+    write_recipe(root, "gamma", "1.0.0");
+
+    auto discovered = overlay::load_with_files(root);
+    EXPECT_FALSE(overlay::find_entry(discovered, "no-such-name").has_value());
+    fs::remove_all(root);
+}
+
 // ── gc_identical ──────────────────────────────────────────────────────
 
 TEST(OverlayGc, RemovesOnlyIdentical) {
@@ -312,6 +374,36 @@ TEST(OverlayGc, NoOpWhenNothingIdentical) {
     auto removed = overlay::gc_identical(overlayDir, repos);
     EXPECT_TRUE(removed.empty());
     EXPECT_TRUE(fs::exists(overlay::recipe_path(overlayDir, "solo")));
+    fs::remove_all(root);
+}
+
+TEST(OverlayGc, RemovesAMissingTrackedEntry) {
+    // A tracked entry whose file was deleted out from under the overlay's
+    // own bookkeeping: no bytes to compare (so it can never be Identical),
+    // but it is still provenance garbage -- `gc_identical` must drop the
+    // `.overlay.json` record even though there is no file left to delete.
+    auto root = make_temp_dir("gc-missing");
+    auto overlayDir = root / "overlay";
+    // A healthy sibling, to prove the blast radius is just the one entry.
+    write_recipe(overlayDir, "healthy", "1.0.0");
+
+    std::map<std::string, overlay::Entry> entries;
+    entries["ghost"]   = {.name = "ghost", .version = "1.0.0"};  // no file
+    entries["healthy"] = {.name = "healthy", .version = "1.0.0"};
+    overlay::save(overlayDir, entries);
+
+    ASSERT_FALSE(fs::exists(overlay::recipe_path(overlayDir, "ghost")));
+
+    std::vector<overlay::RepoDir> repos;  // no upstream repos needed
+    auto removed = overlay::gc_identical(overlayDir, repos);
+
+    ASSERT_EQ(removed.size(), 1u);
+    EXPECT_EQ(removed[0], "ghost");
+
+    auto remaining = overlay::load(overlayDir);
+    EXPECT_FALSE(remaining.contains("ghost"));
+    EXPECT_TRUE(remaining.contains("healthy"));
+    EXPECT_TRUE(fs::exists(overlay::recipe_path(overlayDir, "healthy")));
     fs::remove_all(root);
 }
 
