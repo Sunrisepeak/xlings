@@ -1430,20 +1430,21 @@ int dispatch_(int argc, char* argv[]) {
     if (fargc >= 2) {
         // Handle -h/--help/--version before cmdline library to avoid
         // std::format width-specifier crash in GCC 15 C++23 modules.
-        if (cmd == "-h" || cmd == "--help" || cmd.empty()) {
-            if (cmd.empty()) {
-                // Only flags, no command — check if -h was requested
-                for (int i = 1; i < fargc; ++i) {
-                    std::string_view a { fargv[i] };
-                    if (a == "-h" || a == "--help") { ui::print_help(Info::VERSION); return 0; }
-                    if (a == "--version") { std::println("xlings {}", Info::VERSION); return 0; }
-                }
+        //
+        // No `cmd == "-h"` / `cmd == "--help"` / `cmd == "--version"` branch
+        // here: the loop above only ever assigns `cmd` from an argument that
+        // does NOT start with `-` (see its own comment), so `cmd` can never
+        // hold any of the three -- those three comparisons were dead code,
+        // unreachable on every input. Only `cmd.empty()` (only flags, no
+        // command at all) is a real case, and its own scan over `fargv`
+        // below is what actually answers -h/--help/--version.
+        if (cmd.empty()) {
+            for (int i = 1; i < fargc; ++i) {
+                std::string_view a { fargv[i] };
+                if (a == "-h" || a == "--help") { ui::print_help(Info::VERSION); return 0; }
+                if (a == "--version") { std::println("xlings {}", Info::VERSION); return 0; }
             }
             ui::print_help(Info::VERSION);
-            return 0;
-        }
-        if (cmd == "--version") {
-            std::println("xlings {}", Info::VERSION);
             return 0;
         }
 
