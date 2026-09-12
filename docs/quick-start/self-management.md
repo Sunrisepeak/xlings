@@ -46,12 +46,14 @@ xlings self doctor
 "没问题但值得知道"的条目（例如只用来锚定发布的包）合并成一行计数。想看全部：
 
 ```bash
-xlings self doctor --all
+xlings self doctor --show-ok
 ```
 
-两个 flag 用来收窄或放宽体检范围（部分较新客户端才有，`--help` 可确认
-是否已支持）：`--subos <NAME>` 只体检指定的那个 SubOS，而不是当前这个；
-`--show-ok` 连"完全正常"的项也逐条打印，而不是默认那样合并成一行计数。
+`--all` 是这个 flag 的旧名字：**已弃用，等同 `--show-ok`**，仍然可用，但新写法
+请直接用 `--show-ok`。
+
+自 2026.9.12.1 起，`--subos <NAME>` 用来收窄体检范围：只体检指定的那个 SubOS，
+而不是当前这个。
 
 ## 修复
 
