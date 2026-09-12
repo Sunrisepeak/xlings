@@ -9,6 +9,10 @@
 # own `.xlings.json`, so the SECOND process to run sees that the first one
 # already said it.
 #
+# I0  a home with NEITHER "verifiedBy" NOR "version" on record (freshly
+#     `self init`-ed, nothing else has ever touched it) prints nothing --
+#     an absent record is not a mismatch, the same rule migration_hint's own
+#     empty guard applies
 # I1  a version mismatch is announced on the first ordinary command and not
 #     on the second
 # I2  `self doctor --fix` converging stamps "verifiedBy", which silences the
@@ -83,6 +87,26 @@ cat > "$HOME_DIR/.xlings.json" <<'EOF'
 { "mirror": "CN" }
 EOF
 RUN self init >/dev/null 2>&1 || fail "self init failed"
+
+echo "== I0: a record-less home (self init alone) says nothing =="
+# `self init` alone never writes "version" -- only `self install`/`self
+# update` do -- so this home genuinely has no record of any client at all.
+# That is not a mismatch; it is the absence of a fact to compare.
+if python3 -c "import json,sys; sys.exit(0 if 'version' in json.load(open(sys.argv[1])) else 1)" \
+      "$HOME_DIR/.xlings.json"; then
+  fail "I0 setup: a plain 'self init' home unexpectedly already has a 'version' key"
+fi
+out0a="$(run_pty list)"
+if grep -q "xlings is now" <<<"$out0a"; then
+  echo "$out0a"
+  fail "I0: a record-less home must not be announced as a version mismatch"
+fi
+out0b="$(run_pty list)"
+if grep -q "xlings is now" <<<"$out0b"; then
+  echo "$out0b"
+  fail "I0: (second run) a record-less home must not be announced"
+fi
+log "  ok — neither run mentioned a version mismatch"
 
 # Backdate the home: a client far older than the one running now set it up,
 # and nothing has verified it since.

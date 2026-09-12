@@ -190,12 +190,31 @@ NamespaceRankResult_ prefer_namespace_rank_(
 std::vector<PackageMatch> prefer_project_scope_(
     std::vector<PackageMatch> matches);
 
+// Whether a namespace-priority demotion is worth a word, computed ONCE and
+// shared by both `PackageCatalog::announce_demotion_`'s in-process gate and
+// `demotion_notice`'s persisted one -- before this they each rebuilt
+// `losers` and the "every loser is a duplicate of the chosen version" check
+// independently, the same verdict derived twice by two copies of the same
+// three lines.
+//
+// nullopt when there is nothing to report: no candidates lost the tiebreak,
+// or every one that did is the identical version already chosen (the
+// ordinary shape of a dev machine with a `local:` copy next to the index's
+// own build, not a conflict).
+struct DemotionVerdict {
+    std::string fingerprint;  // target + "\x1f" + canonicalName + "\x1f" + losers
+    std::string losers;       // comma-joined `coordinate`s, for the message
+};
+
+std::optional<DemotionVerdict> demotion_verdict(const std::string& target,
+                                                const PackageMatch& chosen);
+
 // The decision behind `PackageCatalog::announce_demotion_`, and the only
-// part of it worth unit-testing: whether a demotion is worth a word (a real
-// alternative version, not a duplicate of the one already chosen) and
-// whether this Memo has already said so. Free function with an injected
-// `notice::Memo` rather than a `PackageCatalog` member, so a test can drive
-// it without a home or a loaded catalog -- see test_xim_catalog.cpp.
+// part of it worth unit-testing: whether a demotion is worth a word (via
+// `demotion_verdict`) and whether this Memo has already said so. Free
+// function with an injected `notice::Memo` rather than a `PackageCatalog`
+// member, so a test can drive it without a home or a loaded catalog -- see
+// test_xim_catalog.cpp.
 //
 // Returns true when it emitted.
 bool demotion_notice(const std::string& target, const PackageMatch& chosen,

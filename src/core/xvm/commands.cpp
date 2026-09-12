@@ -13,7 +13,6 @@ import xlings.libs.json;
 import xlings.core.semver;
 import xlings.core.entry_binary;
 import xlings.core.xself;
-import xlings.core.xself.repair;
 import xlings.core.xvm.types;
 import xlings.core.xvm.db;
 import xlings.core.xvm.lock;

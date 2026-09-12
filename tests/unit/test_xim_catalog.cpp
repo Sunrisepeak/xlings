@@ -908,6 +908,47 @@ TEST(XimNamespacePriorityTest, LocalAloneStillResolves) {
     EXPECT_TRUE(got->demoted.empty());
 }
 
+// ── demotion verdict: one rule, shared by the gate and the notice ─────────
+//
+// `detail_::demotion_verdict` is the single place that decides "is every
+// demoted candidate a duplicate of the version already chosen" and builds
+// the fingerprint/`losers` string from it -- both `announce_demotion_`'s
+// in-process gate and `demotion_notice`'s persisted one call it rather than
+// each recomputing the same three lines (review finding: they used to).
+
+TEST(XimDemotionVerdict, SameVersionIsNullopt) {
+    xlings::xim::PackageMatch chosen;
+    chosen.canonicalName = "xim:xlings";
+    chosen.version = "0.4.51";
+    chosen.demoted = { { "local:xlings@0.4.51", "0.4.51" } };
+
+    EXPECT_FALSE(xlings::xim::detail_::demotion_verdict("xlings", chosen)
+                     .has_value())
+        << "every demoted candidate is the version already chosen: nothing "
+           "to verdict";
+}
+
+TEST(XimDemotionVerdict, NoDemotedCandidatesIsNullopt) {
+    xlings::xim::PackageMatch chosen;
+    chosen.canonicalName = "xim:xlings";
+    chosen.version = "2026.8.11.1";
+
+    EXPECT_FALSE(xlings::xim::detail_::demotion_verdict("xlings", chosen)
+                     .has_value());
+}
+
+TEST(XimDemotionVerdict, MixedVersionsProducesFingerprintAndLosers) {
+    xlings::xim::PackageMatch chosen;
+    chosen.canonicalName = "xim:xlings";
+    chosen.version = "2026.8.11.1";
+    chosen.demoted = { { "local:xlings@0.4.51", "0.4.51" } };
+
+    auto verdict = xlings::xim::detail_::demotion_verdict("xlings", chosen);
+    ASSERT_TRUE(verdict.has_value());
+    EXPECT_EQ(verdict->losers, "local:xlings@0.4.51");
+    EXPECT_EQ(verdict->fingerprint, "xlings\x1f" "xim:xlings\x1f" "local:xlings@0.4.51");
+}
+
 // ── demotion notice: a pure duplicate is not a conflict ───────────────────
 //
 // `local:xlings@0.4.51` sitting next to `xim:xlings@0.4.51` is the ordinary

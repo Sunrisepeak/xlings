@@ -355,18 +355,17 @@ void show_upgrade_notice_once_() {
 
     auto verified = Config::recorded_verified_version();
     if (verified.empty()) verified = Config::recorded_client_version();
-    if (verified == Info::VERSION) return;
+    // An absent record is not a mismatch -- the same rule `migration_hint`
+    // applies to its own empty guard. A home with neither field set (one
+    // from before either existed, or one built by `self init` alone) has
+    // nothing to compare against, and announcing a claim this code cannot
+    // back up would be worse than saying nothing.
+    if (verified.empty() || verified == Info::VERSION) return;
 
-    // An empty string is not "an earlier version" -- it is "nothing on
-    // record", a home from before either field existed. Still worth the one
-    // notice (the `self doctor` it points at is what stamps the record for
-    // good), just not worth a claim this code cannot back up.
-    const auto verifiedOrSetup = verified.empty()
-        ? std::string("an unrecorded version") : verified;
     notice::notice_once("client.upgraded", Info::VERSION, {
         .code    = "self.upgraded",
         .summary = std::format("xlings is now {}; this home was last "
-                               "verified by {}", Info::VERSION, verifiedOrSetup),
+                               "verified by {}", Info::VERSION, verified),
         .actions = { { "check the home", "xlings self doctor" } },
     });
 }
@@ -1401,8 +1400,11 @@ int dispatch_(int argc, char* argv[]) {
     // show_upgrade_notice_once_. `self`/`interface` are excluded: `self
     // doctor`/`self update` report the same fact as part of their own job,
     // and `interface` is a machine's NDJSON stream, not a person's terminal.
-    if (!cmd.empty() && cmd != "self" && cmd != "interface"
-        && cmd != "--version" && cmd != "-h") {
+    // No `--version`/`-h` check needed here: the loop above only assigns
+    // `cmd` from an argument that does NOT start with `-`, so `cmd` can
+    // never hold either of those (and `cmd.empty()` already covers a bare
+    // `xlings` with no command at all).
+    if (!cmd.empty() && cmd != "self" && cmd != "interface") {
         show_upgrade_notice_once_();
     }
 
