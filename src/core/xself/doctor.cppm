@@ -293,6 +293,16 @@ enum class FindingKind {
     // changed. Readers collapse the pair now; `--fix` merges it. Measured on
     // a real home: 240 such pairs, and `use` was landing on the wrong half.
     DuplicateVersionKey,
+    // A `subos/<name>/.xlings.json` that load_subos_snapshots() could not
+    // turn into a snapshot: invalid JSON, not an object, or missing the
+    // `workspace` field. Used to be skipped with `catch (...) {}` and never
+    // reported anywhere -- a hand-edit mistake in ONE subos silently dropped
+    // it from every cross-subos question (reference counting, `list --all`,
+    // this very audit) with no signal that it had happened. Warning, not
+    // Error: the rest of this subos and every OTHER subos are unaffected,
+    // which is the point -- one broken subos must not change what other
+    // commands report for the rest of the home.
+    SubosUnreadable,
 };
 
 enum class FindingLevel {
@@ -330,12 +340,31 @@ struct Finding {
     // one separately buries everything else.
     std::string  groupKey;
     bool         active { false };
+    // BrokenPayload only: no subos anywhere -- not this one, not any other
+    // (see `subos::ownership`) -- claims this (target, version), and it is
+    // not this subos's active pick either. Nothing would ever run it again.
+    //
+    // Distinct from `remedy` being empty: a package this catalog cannot
+    // resolve is unclaimed AND remedy-less, but plenty of unclaimed entries
+    // resolve fine -- an old mcpp release the index still ships, that no
+    // subos still points at. For THOSE the remedy stays printed (it is a
+    // true fact: running it brings the entry back), while `--fix` prunes
+    // the registration instead of paying for the download. See
+    // repair_payloads_.
+    bool         unclaimed { false };
     std::vector<std::string> subos;
     fs::path     shimPath;      // shim-layer findings only
 };
 
 struct Scan {
     std::vector<Finding> findings;
+    // Whether a package catalog was available to answer "does anything
+    // provide this entry" when this scan ran. False is "unknown", not "no" --
+    // a remedy-less BrokenPayload finding must say the index could not be
+    // consulted rather than implying no package exists, and the two read as
+    // the same thing (`remedy.empty()`) to everything downstream of
+    // detection. See render_'s "no remedy" branch.
+    bool probeAvailable { false };
 };
 
 // Everything detection reads. Rebuilt from disk between passes, because the
@@ -347,6 +376,9 @@ struct DoctorState {
     xvm::WorkspaceInstalled  wsInstalled;
     std::vector<xvm::SubosRef>          otherSubos;
     std::vector<profile::SubosSnapshot> otherSnapshots;
+    // Names of subos directories under this home whose .xlings.json exists
+    // but could not be read as one -- see FindingKind::SubosUnreadable.
+    std::vector<std::string>            unreadableSubos;
     fs::path                 xlingsBin;
     std::string              homeStr;
     // Computed once per state load, consumed by detection AND by both
@@ -391,6 +423,14 @@ struct AuditSelection {
     // `--deep` (one pass) wants, and what every test that has not opted in
     // gets.
     elfcheck::PayloadScanCache* payloadCache { nullptr };
+
+    // Whether cmd_doctor built a package catalog for this scan. Threaded in
+    // rather than inferred from CoordinateProbe's answer, because the probe
+    // returns `false` both when the catalog is missing and when it is
+    // present and genuinely has nothing -- the two need different words in
+    // the report (see Scan::probeAvailable) and only the caller that built
+    // (or didn't build) the catalog knows which.
+    bool probeAvailable { false };
 
     // What the payload audit actually covered, reported when it finishes.
     //
@@ -452,6 +492,33 @@ struct RepairReport {
     // did not happen. A finding that vanished because its registration was
     // dropped was not healed: nothing about it was made to work.
     std::vector<std::pair<std::string, std::string>> prunedEntries;
+    // Subos the cross-subos walk (repair_other_subos_walk_) could not
+    // repair: name, and the child's exit code (-1 when the walk refused to
+    // even run it -- an unsafe name).
+    //
+    // NOT folded into `failedEntries`, which is keyed by (target, version):
+    // this failure is per-SUBOS, and a child that dies before printing a
+    // single finding leaves nothing to key by. Kept separate so a caller
+    // can name the subos and the command to re-run without guessing which
+    // (target, version) pairs were behind it -- the render layer already
+    // gets that from the note text; this is what gates the exit code and
+    // the stamp the same way an outstanding failedEntries victim does. A
+    // subos that failed here is, by definition, not converged: its findings
+    // were never re-detected by THIS process (the child exited already
+    // anchored to it), so there is no `stillFound`-style check to run --
+    // its mere presence in this list is the outstanding work.
+    std::vector<std::pair<std::string, int>> failedSubos;
+    // Coordinates R3 genuinely REMOVED and then failed to put back.
+    //
+    // Unconditional, like `failedSubos`, and for the identical reason: this
+    // is the one ladder outcome where the finding it started from is
+    // GUARANTEED to be gone from re-detection -- the registration really
+    // was dropped -- so folding it into `failedEntries` and gating on
+    // `stillFound` would always read "healed" for a package the user just
+    // lost. `repair_one` already says so in its note ("REMOVED but could
+    // not reinstall"); this is what makes that sentence gate the stamp and
+    // the exit code instead of scrolling past as one more line of prose.
+    std::vector<std::string> removedNotReinstalled;
     // Commands `--dry-run` would have run.
     std::vector<std::string> planned;
     // `--fix` ended with more issues than it started with. Sets the exit code
@@ -501,8 +568,9 @@ struct Counts {
 export int cmd_doctor(EventStream& stream, bool fix,
                       bool resetMetadata = false,
                       bool dryRun = false,
-                      bool verbose = false,
+                      bool showOk = false,
                       bool deep = false,
-                      std::optional<std::string> scope = std::nullopt);
+                      std::optional<std::string> scope = std::nullopt,
+                      std::optional<std::string> subos = std::nullopt);
 
 } // namespace xlings::xself

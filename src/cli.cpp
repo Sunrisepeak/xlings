@@ -12,6 +12,7 @@ import mcpplibs.cmdline;
 import mcpplibs.capi.lua;
 import mcpplibs.xpkg.executor;
 import xlings.core.config;
+import xlings.core.notice;
 import xlings.core.home_config;
 import xlings.libs.json;
 import xlings.core.log;
@@ -333,6 +334,39 @@ void show_interactive_hint_once_() {
         .summary = "xlings can ask instead of printing a list",
         .facts   = { { "keys", "up/down to move, enter to pick, esc to skip" } },
         .actions = { { "turn it off", "xlings config --interactive false" } },
+    });
+}
+
+// ─── Upgrade notice: told once per version, not once per command ───
+//
+// Four call sites used to print "run xlings self doctor --fix" on every
+// command whenever the home's recorded version differed from the running
+// one -- because none of them had cross-process memory. `notice::notice_once`
+// is the memory; this is the one caller that fires on an ordinary command
+// rather than from inside `self doctor`/`self update` (which report the same
+// fact as part of their own output, not as an interruption).
+//
+// TTY-gated for the same reason as `show_interactive_hint_once_`: a script
+// piping `xlings list` output must see only what it asked for. Excluded on
+// `self`/`interface`: `self doctor`/`self update` already say this as part of
+// their job, and `interface` is a machine's NDJSON stream.
+void show_upgrade_notice_once_() {
+    if (!platform::supports_rewrite_output()) return;
+
+    auto verified = Config::recorded_verified_version();
+    if (verified.empty()) verified = Config::recorded_client_version();
+    // An absent record is not a mismatch -- the same rule `migration_hint`
+    // applies to its own empty guard. A home with neither field set (one
+    // from before either existed, or one built by `self init` alone) has
+    // nothing to compare against, and announcing a claim this code cannot
+    // back up would be worse than saying nothing.
+    if (verified.empty() || verified == Info::VERSION) return;
+
+    notice::notice_once("client.upgraded", Info::VERSION, {
+        .code    = "self.upgraded",
+        .summary = std::format("xlings is now {}; this home was last "
+                               "verified by {}", Info::VERSION, verified),
+        .actions = { { "check the home", "xlings self doctor" } },
     });
 }
 
@@ -884,6 +918,24 @@ int cmd_config_(const mcpplibs::cmdline::ParsedArgs& args, EventStream& stream) 
         return xim::cmd_add_xpkg(std::string(*xpkg), stream);
     }
 
+    // --list-xpkg
+    if (args.is_flag_set("list-xpkg")) {
+        if (!commit_edits()) return 1;
+        return xim::cmd_list_xpkg();
+    }
+
+    // --remove-xpkg <NAME>
+    if (auto name = args.value("remove-xpkg")) {
+        if (!commit_edits()) return 1;
+        return xim::cmd_remove_xpkg(std::string(*name));
+    }
+
+    // --clear-xpkg <all|stale>
+    if (auto what = args.value("clear-xpkg")) {
+        if (!commit_edits()) return 1;
+        return xim::cmd_clear_xpkg(std::string(*what));
+    }
+
     // --index-repo  namespace:https://....git
     if (auto repo = args.value("index-repo")) {
         std::string val(*repo);
@@ -1362,24 +1414,37 @@ int dispatch_(int argc, char* argv[]) {
         if (!a.starts_with("-")) { cmd = std::string(a); break; }
     }
 
+    // Told once per version, not once per command -- see
+    // show_upgrade_notice_once_. `self`/`interface` are excluded: `self
+    // doctor`/`self update` report the same fact as part of their own job,
+    // and `interface` is a machine's NDJSON stream, not a person's terminal.
+    // No `--version`/`-h` check needed here: the loop above only assigns
+    // `cmd` from an argument that does NOT start with `-`, so `cmd` can
+    // never hold either of those (and `cmd.empty()` already covers a bare
+    // `xlings` with no command at all).
+    if (!cmd.empty() && cmd != "self" && cmd != "interface") {
+        show_upgrade_notice_once_();
+    }
+
     // Special: subos, self, script need raw argc/argv
     if (fargc >= 2) {
         // Handle -h/--help/--version before cmdline library to avoid
         // std::format width-specifier crash in GCC 15 C++23 modules.
-        if (cmd == "-h" || cmd == "--help" || cmd.empty()) {
-            if (cmd.empty()) {
-                // Only flags, no command — check if -h was requested
-                for (int i = 1; i < fargc; ++i) {
-                    std::string_view a { fargv[i] };
-                    if (a == "-h" || a == "--help") { ui::print_help(Info::VERSION); return 0; }
-                    if (a == "--version") { std::println("xlings {}", Info::VERSION); return 0; }
-                }
+        //
+        // No `cmd == "-h"` / `cmd == "--help"` / `cmd == "--version"` branch
+        // here: the loop above only ever assigns `cmd` from an argument that
+        // does NOT start with `-` (see its own comment), so `cmd` can never
+        // hold any of the three -- those three comparisons were dead code,
+        // unreachable on every input. Only `cmd.empty()` (only flags, no
+        // command at all) is a real case, and its own scan over `fargv`
+        // below is what actually answers -h/--help/--version.
+        if (cmd.empty()) {
+            for (int i = 1; i < fargc; ++i) {
+                std::string_view a { fargv[i] };
+                if (a == "-h" || a == "--help") { ui::print_help(Info::VERSION); return 0; }
+                if (a == "--version") { std::println("xlings {}", Info::VERSION); return 0; }
             }
             ui::print_help(Info::VERSION);
-            return 0;
-        }
-        if (cmd == "--version") {
-            std::println("xlings {}", Info::VERSION);
             return 0;
         }
 
@@ -1636,7 +1701,10 @@ int dispatch_(int argc, char* argv[]) {
         .subcommand("remove")
             .description("Remove a package")
             .option(cmdline::Option("global").short_name('g').help("Act on the global scope (not the project-local subos)"))
-            .option(cmdline::Option("force").help("Remove even if installed packages depend on it"))
+            .option(cmdline::Option("force").help("Remove even if packages depend on it, the recipe is gone, or its uninstall hook fails"))
+            .option(cmdline::Option("all").help("Remove every installed version, not just the active one"))
+            .option(cmdline::Option("all-subos").help("Remove from every subos that has it installed"))
+            .option(cmdline::Option("subos").takes_value().value_name("NAME").help("Act on this subos only, instead of the current one"))
             .arg("package").required().help("Package to remove (name or name@ver)")
             .arg("version").help("Optional version (alternative to name@ver form)")
             .action(wrap_rc([&stream](const cmdline::ParsedArgs& args) -> int {
@@ -1652,7 +1720,18 @@ int dispatch_(int argc, char* argv[]) {
                 // link is a different decision and a scripted `remove -y`
                 // should still be stopped by it.
                 bool force = args.is_flag_set("force");
-                return xim::cmd_remove(target, yes, stream, force);
+                bool all = args.is_flag_set("all");
+                // --subos names one subos directly; --all-subos means every
+                // subos that references the target ("*"); neither means "act
+                // on the current subos" (nullopt), the pre-existing default.
+                // --subos wins if both are somehow given.
+                std::optional<std::string> subosScope;
+                if (auto named = args.value("subos")) {
+                    subosScope = *named;
+                } else if (args.is_flag_set("all-subos")) {
+                    subosScope = "*";
+                }
+                return xim::cmd_remove(target, yes, stream, force, all, subosScope);
             }))
 
         // update
@@ -1780,6 +1859,9 @@ int dispatch_(int argc, char* argv[]) {
             .option(cmdline::Option("theme").takes_value().value_name("THEME").help("Set colour theme (name or path)"))
             .option(cmdline::Option("interactive").takes_value().value_name("BOOL").help("Inline prompts in tui mode (true/false)"))
             .option(cmdline::Option("add-xpkg").takes_value().value_name("FILE").help("Add xpkg file to package index"))
+            .option(cmdline::Option("list-xpkg").help("List local recipes and how they relate to the synced index"))
+            .option(cmdline::Option("remove-xpkg").takes_value().value_name("NAME").help("Remove one local recipe"))
+            .option(cmdline::Option("clear-xpkg").takes_value().value_name("all|stale").help("Remove local recipes (all, or stale = identical/behind the synced index)"))
             .option(cmdline::Option("index-repo").takes_value().value_name("NS:URL").help("Add/update index repo (e.g. myns:https://...git)"))
             .action(wrap_rc([&stream](const cmdline::ParsedArgs& args) -> int {
                 apply_global_opts_(args);

@@ -11,6 +11,7 @@ import xlings.core.utils;
 import xlings.libs.tinyhttps;
 import xlings.core.xvm.types;
 import xlings.core.xvm.db;
+import xlings.core.xvm.lock;
 
 namespace xlings {
 
@@ -1269,6 +1270,88 @@ void Config::save_versions() {
     platform::write_string_to_file(configPath.string(), json.dump(2));
 }
 
+namespace {
+
+// RMW of `~/.xlings.json` under the home-wide state lock, for the three
+// near-every-command writers below (the client-version stamp, the
+// verified-version stamp, the hints-seen memo) -- the same file the
+// versions DB lives in, mutated without the lock `install`/`remove`/`use`
+// already take for it. `list` and `use` now call `notice::notice_once` on
+// nearly every invocation (2026.9.12), and a `list` racing an `install`'s
+// own read-modify-write of this file was a plain lost update: two readers
+// of the old bytes, two writers of a new version each containing only
+// their own change, last writer wins over the versions DB, not just the
+// field this function meant to touch.
+//
+// Deliberately NOT worth what `install`/`remove` pay to take this lock.
+// None of these three writes is worth blocking a `list` over, so the
+// timeout is short and the failure mode is silent: skip the write, let the
+// note repeat (or the version stamp lag) until the next call gets a clear
+// run at the lock. A LOST hint is an inconvenience; a lost versions-DB
+// entry -- which is what writing without the lock risked -- is not.
+//
+// `XLINGS_LOCK_TIMEOUT` is cleared for the one call below and restored
+// immediately after. That variable exists so a machine doing a genuinely
+// long install can wait longer than the ten-minute default for ANOTHER
+// xlings to get out of the way -- exactly the wait this helper must not
+// inherit, since honouring it here would turn a passive version-stamp
+// write into another blocked-on-that-same-install command.
+//
+// Reentry is handled by `acquire_state_lock` itself, not by this function:
+// its marker is a process environment variable, read the same way whether
+// the holder is an ancestor process or an outer call further up THIS
+// process's own stack, so a caller that already holds the lock (a doctor
+// `--fix` stamping the home at the end of a repair pass it took the lock
+// for) gets `inherited()` back immediately -- no second flock, no wait, no
+// deadlock.
+//
+// `mutate` receives the parsed document (a fresh empty object when the
+// file is absent) and returns false to refuse the write outright -- what
+// every one of these three writers already did for a file that exists but
+// does not parse as JSON: overwriting it would trade a stale field for a
+// lost versions DB, and that is never the right trade. Refusing (parse
+// failure or `mutate` declining) is reported the same way it always was --
+// success, having done nothing. A genuine write I/O failure still comes
+// back as an error, exactly as before this lock existed. The one new
+// outcome is the lock itself: unlike the other two refusals, "another
+// xlings has this home right now" is worth telling a caller that already
+// has somewhere to put it (doctor's stamp-failure note), so it comes back
+// as an error too rather than being silently folded into "did nothing".
+std::expected<void, std::string> rmw_home_config_locked_(
+        const std::filesystem::path& homeDir,
+        const std::filesystem::path& configPath,
+        const std::function<bool(nlohmann::json&)>& mutate) {
+    constexpr auto kTimeout = std::chrono::seconds{2};
+
+    const auto savedTimeout =
+        utils::get_env_or_default(std::string(xvm::lock_timeout_env()));
+    platform::set_env_variable(std::string(xvm::lock_timeout_env()), "");
+    auto lock = xvm::acquire_state_lock(homeDir, kTimeout);
+    platform::set_env_variable(std::string(xvm::lock_timeout_env()),
+                               savedTimeout);
+    if (!lock) return std::unexpected(lock.error());
+
+    nlohmann::json json = nlohmann::json::object();
+    if (std::filesystem::exists(configPath)) {
+        try {
+            auto content = platform::read_file_to_string(configPath.string());
+            json = nlohmann::json::parse(content, nullptr, false);
+            if (json.is_discarded() || !json.is_object()) return {};
+        } catch (...) { return {}; }
+    }
+
+    if (!mutate(json)) return {};
+
+    try {
+        platform::write_string_to_file(configPath.string(), json.dump(2));
+    } catch (const std::exception& e) {
+        return std::unexpected(e.what());
+    }
+    return {};
+}
+
+}  // namespace
+
 [[nodiscard]] std::string Config::recorded_client_version() {
     namespace fs = std::filesystem;
     auto configPath = instance_().paths_.homeDir / ".xlings.json";
@@ -1285,53 +1368,76 @@ void Config::save_versions() {
 
 std::expected<void, std::string>
 Config::record_client_version(const std::string& version) {
+    auto& self = instance_();
+    auto configPath = self.paths_.homeDir / ".xlings.json";
+    // Under the state lock (see rmw_home_config_locked_): this is the same
+    // file the versions DB lives in, and a mutating command running at the
+    // same moment must not have its own write clobbered by this one.
+    return rmw_home_config_locked_(self.paths_.homeDir, configPath,
+                                   [&](nlohmann::json& json) {
+                                       json["version"] = version;
+                                       return true;
+                                   });
+}
+
+[[nodiscard]] std::string Config::recorded_verified_version() {
     namespace fs = std::filesystem;
     auto configPath = instance_().paths_.homeDir / ".xlings.json";
-    nlohmann::json json = nlohmann::json::object();
-    if (fs::exists(configPath)) {
-        try {
-            auto content = platform::read_file_to_string(configPath.string());
-            json = nlohmann::json::parse(content, nullptr, false);
-            if (json.is_discarded() || !json.is_object()) {
-                // Refuse to replace a file we could not parse. Overwriting
-                // it here would trade a stale version field for a lost
-                // versions DB. Not an error to report: the refusal is the
-                // correct outcome, and the unreadable file has its own
-                // finding.
-                return {};
-            }
-        } catch (...) { return {}; }
-    }
-    json["version"] = version;
+    if (!fs::exists(configPath)) return {};
     try {
-        platform::write_string_to_file(configPath.string(), json.dump(2));
-    } catch (const std::exception& e) {
-        return std::unexpected(e.what());
-    }
-    return {};
+        auto content = platform::read_file_to_string(configPath.string());
+        auto json = nlohmann::json::parse(content, nullptr, false);
+        if (json.is_discarded() || !json.is_object()) return {};
+        auto it = json.find("verifiedBy");
+        if (it == json.end() || !it->is_string()) return {};
+        return it->get<std::string>();
+    } catch (...) { return {}; }
+}
+
+std::expected<void, std::string>
+Config::record_verified_version(const std::string& version) {
+    auto& self = instance_();
+    auto configPath = self.paths_.homeDir / ".xlings.json";
+    // Under the state lock: see record_client_version and
+    // rmw_home_config_locked_. `self doctor --fix` stamps this at the very
+    // end of a repair pass, by which point every lock this same process
+    // took for its own repairs has already gone out of scope -- so this is
+    // an ordinary, uncontended lock/unlock in the common case, not a
+    // reentrant one.
+    return rmw_home_config_locked_(self.paths_.homeDir, configPath,
+                                   [&](nlohmann::json& json) {
+                                       json["verifiedBy"] = version;
+                                       return true;
+                                   });
 }
 
 void Config::mark_hint_seen(std::string_view id) {
-    namespace fs = std::filesystem;
-    auto configPath = instance_().paths_.homeDir / ".xlings.json";
-    nlohmann::json json = nlohmann::json::object();
-    if (fs::exists(configPath)) {
-        try {
-            auto content = platform::read_file_to_string(configPath.string());
-            json = nlohmann::json::parse(content, nullptr, false);
-            // Same refusal as record_client_version: never replace a document
-            // we could not parse. Trading an unshown hint for a lost versions
-            // DB is not a trade.
-            if (json.is_discarded() || !json.is_object()) return;
-        } catch (...) { return; }
-    }
-    auto& seen = json["hintsSeen"];
-    if (!seen.is_array()) seen = nlohmann::json::array();
-    for (const auto& e : seen) {
-        if (e.is_string() && e.get<std::string>() == id) return;
-    }
-    seen.push_back(std::string(id));
-    platform::write_string_to_file(configPath.string(), json.dump(2));
+    auto& self = instance_();
+    auto configPath = self.paths_.homeDir / ".xlings.json";
+    // Under the state lock: see record_client_version and
+    // rmw_home_config_locked_. This one fires from `notice::notice_once`,
+    // called by `list`/`use`/`install`'s own upgrade notice on nearly every
+    // invocation -- the highest-frequency of the three writers this lock
+    // protects, and a lost `mark` here just means the same note shows up
+    // again next time. The error is not surfaced: this function always
+    // returned void, and a repeated hint was already the accepted failure
+    // mode of its pre-lock parse refusal.
+    std::string idCopy(id);
+    (void)rmw_home_config_locked_(self.paths_.homeDir, configPath,
+                                  [&](nlohmann::json& json) {
+                                      auto& seen = json["hintsSeen"];
+                                      if (!seen.is_array()) {
+                                          seen = nlohmann::json::array();
+                                      }
+                                      for (const auto& e : seen) {
+                                          if (e.is_string()
+                                              && e.get<std::string>() == idCopy) {
+                                              return false;  // already there
+                                          }
+                                      }
+                                      seen.push_back(idCopy);
+                                      return true;
+                                  });
 }
 
 [[nodiscard]] std::vector<std::filesystem::path> Config::known_projects() {
@@ -1452,13 +1558,34 @@ void Config::save_workspace() {
     // is never followed by a spurious write failure (issue #471).
     fs::create_directories(subosConfigPath.parent_path());
 
-    nlohmann::json json;
+    nlohmann::json json = nlohmann::json::object();
     if (fs::exists(subosConfigPath)) {
+        bool parsedOk = false;
         try {
             auto content = platform::read_file_to_string(subosConfigPath.string());
-            json = nlohmann::json::parse(content, nullptr, false);
-            if (json.is_discarded()) json = nlohmann::json::object();
-        } catch (...) { json = nlohmann::json::object(); }
+            auto parsed = nlohmann::json::parse(content, nullptr, false);
+            if (!parsed.is_discarded() && parsed.is_object()) {
+                json = std::move(parsed);
+                parsedOk = true;
+            }
+        } catch (...) { /* parsedOk stays false */ }
+        if (!parsedOk) {
+            // Refuse rather than replace: an unreadable file is not an
+            // empty one. Blanking it here would discard `subos_info`, envs,
+            // and anything else this write does not itself own -- turning
+            // "this subos could not be read" into "this subos is now
+            // empty", the one failure mode a repair cannot walk back.
+            // profile::save_subos_workspace already makes this same
+            // promise for every OTHER subos's file (doctor's cross-subos
+            // repairs write through it); this is THIS subos's own writer,
+            // reached on nearly every install/remove/use, making it too.
+            log::warn(
+                "{}: could not be parsed as JSON; leaving it untouched "
+                "rather than overwriting it with a blank workspace. Run "
+                "`xlings self doctor` to see what needs repair.",
+                display_path(subosConfigPath));
+            return;
+        }
     }
 
     // All four destination paths above target subos-side files

@@ -31,6 +31,7 @@ import xlings.core.xvm.removal;
 import xlings.core.xvm.registration;
 import xlings.core.xvm.errors;
 import xlings.core.subos.manifest;
+import xlings.core.profile;
 import xlings.core.xvm.commands;
 import xlings.core.xvm.shim;
 import xlings.core.xim.libxpkg.types.script;
@@ -752,6 +753,22 @@ bool evict_invalid_archive_cache_(
 
 namespace detail_ {
 
+// Recover `<dataDir>/xpkgs/<store>/<version>` from a version record's
+// (already-expanded) `path`, when there is no recipe left to re-derive it
+// from `PackageMatch`. One parser for store paths: `coordinate_from_payload_path`
+// (xvm/owner.cpp) already does the right-to-left "two components after the
+// LAST xpkgs" walk and is used by five other files; this just re-encodes its
+// answer back into a directory with the same `-x-` join `package_store_name`
+// writes, rather than re-deriving the cut here a second time.
+std::optional<std::filesystem::path> store_version_dir_from_recorded_path_(
+        const std::string& expandedPath,
+        const std::filesystem::path& dataDir) {
+    auto coord = xvm::coordinate_from_payload_path(expandedPath);
+    if (!coord) return std::nullopt;
+    return dataDir / "xpkgs" / package_store_name(coord->ns, coord->package)
+        / coord->version;
+}
+
 std::string format_hook_failure(
         std::string_view hookName,
         const mcpplibs::xpkg::HookResult& result) {
@@ -1231,6 +1248,31 @@ xvm::SubosWorkspace load_workspace_file_(const std::filesystem::path& path) {
     }
 }
 
+// Same read as `load_workspace_file_`, but distinguishes "read fine, and
+// the workspace is genuinely empty" from "could not be read" -- a
+// difference `load_workspace_file_`'s callers so far never needed to see
+// (a missing state file for a subos nobody has referenced yet is a normal
+// empty workspace to them, not a fault). A caller that already has other
+// evidence this file OUGHT to contain something (its own separate scan
+// found this exact subos pinning a version) needs the distinction: nullopt
+// says "do not trust the empty result you would otherwise get", where the
+// plain function above cannot tell its caller that.
+std::optional<xvm::SubosWorkspace>
+load_workspace_file_checked_(const std::filesystem::path& path) {
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) return std::nullopt;
+    try {
+        auto content = platform::read_file_to_string(path.string());
+        auto json = nlohmann::json::parse(content, nullptr, false);
+        if (json.is_discarded() || !json.is_object()) return std::nullopt;
+        if (!json.contains("workspace") || !json["workspace"].is_object())
+            return std::nullopt;
+        return xvm::subos_workspace_from_json(json["workspace"]);
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
 std::vector<std::filesystem::path> workspace_config_paths_for_scope_(PackageScope scope) {
     namespace fs = std::filesystem;
     (void)scope;
@@ -1273,12 +1315,57 @@ std::vector<std::filesystem::path> workspace_config_paths_for_scope_(PackageScop
     return paths;
 }
 
-bool is_version_referenced_anywhere_(PackageScope scope, const std::string& target, const std::string& version, const std::filesystem::path& excludePath) {
+bool is_version_referenced_anywhere_(PackageScope scope, const std::string& target, const std::string& version, const std::filesystem::path& excludePath, bool force) {
     std::error_code ec;
     auto excludeCanonical = excludePath.empty() ? std::filesystem::path{} : std::filesystem::weakly_canonical(excludePath, ec);
+
+    // Collected across the WHOLE scan before any decision is reported --
+    // not returned on the first hit. `pinned_by`'s own report (see
+    // find_subos_pinning_version, cmd_remove_resolved_) already lists every
+    // unreadable subos it found; this function used to stop at the first
+    // one and warn about only that name, so the decision-time diagnostic
+    // and the follow-up report disagreed about how many subos were even in
+    // question -- one name here, all of them there.
+    std::vector<std::string> unreadable;
+
     for (auto& configPath : workspace_config_paths_for_scope_(scope)) {
         auto canonical = std::filesystem::weakly_canonical(configPath, ec);
         if (!excludeCanonical.empty() && !ec && canonical == excludeCanonical) {
+            continue;
+        }
+
+        // A subos whose file simply doesn't exist yet has never referenced
+        // anything -- that is the ordinary "never used" state load_subos_
+        // snapshots also treats as empty, not a fault. Only a file that
+        // EXISTS but cannot be turned into a workspace is the controller
+        // ruling's "unreadable" case below.
+        std::error_code existsEc;
+        if (!std::filesystem::exists(configPath, existsEc)) continue;
+
+        // Controller ruling (2026.9.12): an unreadable subos must be
+        // treated as "might still use this payload", not as "does not use
+        // it". Silently reading it the second way is exactly how `xlings
+        // remove` did a FULL removal (payload deleted) while a corrupted
+        // sibling subos was still actively using the same version -- the
+        // corruption made the sibling invisible to this scan instead of
+        // making the scan refuse to guess. Erring toward "still
+        // referenced" only over-retains a payload GC can reclaim later
+        // once the file is fixed; the opposite error deletes something a
+        // live subos needs, with no way back.
+        //
+        // `--force` does NOT override this. Force on `remove <pkg>` means
+        // "remove this package even if this command would otherwise
+        // object" -- it does not mean "delete a payload a DIFFERENT,
+        // unrelated subos may still need". That would be damaging that
+        // other subos's state, not forcing this removal.
+        //
+        // Recorded and the scan CONTINUES: a later subos in this same
+        // pass may still supply a definite match, and even if none does,
+        // every unreadable name found belongs in the one warning below,
+        // not just whichever happened to sort first.
+        auto checkedSws = load_workspace_file_checked_(configPath);
+        if (!checkedSws) {
+            unreadable.push_back(configPath.parent_path().filename().string());
             continue;
         }
         // 0.4.19+: a payload is "referenced" by a subos if EITHER its
@@ -1300,7 +1387,7 @@ bool is_version_referenced_anywhere_(PackageScope scope, const std::string& targ
         auto matches = [&](std::string_view stored) {
             return xvm::version_key_matches(version, stored);
         };
-        auto sws = load_workspace_file_(configPath);
+        auto& sws = *checkedSws;
         if (auto it = sws.active.find(target);
             it != sws.active.end() && matches(it->second)) return true;
         if (auto it = sws.installed.find(target); it != sws.installed.end()) {
@@ -1309,7 +1396,37 @@ bool is_version_referenced_anywhere_(PackageScope scope, const std::string& targ
             }
         }
     }
-    return false;
+
+    if (unreadable.empty()) return false;
+
+    std::string names;
+    std::string commands;
+    for (const auto& n : unreadable) {
+        if (!names.empty()) names += ", ";
+        names += n;
+        if (!commands.empty()) commands += "; ";
+        // One runnable command per subos, not a "<name>" placeholder: a
+        // printed remedy has to be something the reader can paste, and
+        // "repair each of these" is not that when there is more than one.
+        commands += std::format("xlings self doctor --subos {}", n);
+    }
+    log::warn(
+        "{} — {} workspace file could not be read, so it is not known "
+        "whether {} still uses {}@{} -- treating it as still referencing "
+        "the payload and keeping it (detach-only) rather than risk "
+        "deleting something {} needs.{} Run `{}` to repair it.",
+        names,
+        unreadable.size() == 1 ? "its" : "their",
+        unreadable.size() == 1 ? "it" : "one of them",
+        target, version,
+        unreadable.size() == 1 ? "it" : "one of them",
+        force ? " --force does not override this: deleting a "
+                "payload another subos may need is not \"force "
+                "removing this package\", it is damaging that "
+                "other subos."
+              : "",
+        commands);
+    return true;
 }
 
 void remove_target_shims_(const std::string& target, const std::string& version) {
@@ -1937,158 +2054,262 @@ bool process_xvm_operations_(const PlanNode& node,
         }
     }
 
-    for (const auto& effect : metadata->effects) {
-        auto resolved = resolve_xpkg_filesystem_effect(
-            scopedDb, scopedWorkspace, effect);
-        if (!resolved) {
+    // Places this batch's filesystem effects (headers, file assets,
+    // libraries, shims) into ONE subos's sysroot. Extracted so a
+    // registration rewrite can be replayed against every OTHER subos that
+    // pins this version too (#586) without duplicating the per-effect-kind
+    // logic -- the call below for the CURRENT subos is unchanged from
+    // before the extraction.
+    //
+    // `ws` is what gates every `resolved->active` check inside
+    // `resolve_xpkg_filesystem_effect` and the shim branch's own lookup:
+    // passing another subos's workspace here is what makes this only ever
+    // place what THAT subos has made active, never something of ours.
+    // `scopedDb` (the version DB), `xlings_bin` and `shim_ext` stay captured
+    // from the enclosing scope -- they describe the shared payload store and
+    // the one home-level entry binary, neither of which is per-subos.
+    // No `installed[]` parameter: no effect kind placed here needs it,
+    // unlike the caller's own per-subos state (`Config::workspace_
+    // installed()`), which activation elsewhere in this function does read.
+    auto place_effects_into = [&](const std::filesystem::path& subosDir,
+                                   const xvm::Workspace& ws) {
+        const auto binDir = subosDir / "bin";
+        const auto libDir = subosDir / "lib";
+        const auto includeDir = subosDir / "usr" / "include";
+
+        for (const auto& effect : metadata->effects) {
+            auto resolved = resolve_xpkg_filesystem_effect(
+                scopedDb, ws, effect);
+            if (!resolved) {
+                log::warn(
+                    "validated xvm effect target disappeared or changed kind: "
+                    "{}@{}",
+                    effect.target, effect.version);
+                continue;
+            }
+            if (resolved->kind
+                == XpkgFilesystemEffectKind::InstallHeaders) {
+                if (!resolved->active) {
+                    // Installing a non-active version must not disturb the
+                    // sysroot: `xlings use` is what moves headers, and it cannot
+                    // undo this because switching to an already-active version
+                    // is a no-op.
+                    log::debug("[xim] headers for {}@{} not installed: not the "
+                               "active version", resolved->target, resolved->version);
+                    continue;
+                }
+                xvm::install_headers(
+                    resolved->sourceDir, includeDir);
+                continue;
+            }
+            if (resolved->kind
+                == XpkgFilesystemEffectKind::RemoveHeaders) {
+                xvm::remove_headers(
+                    resolved->sourceDir, includeDir);
+                continue;
+            }
+            if (resolved->kind
+                == XpkgFilesystemEffectKind::ProgramShim) {
+                // A shim is only meaningful for a name that has an active
+                // version -- that is what shim_dispatch resolves against, and
+                // without one the file can only ever print "no active version
+                // of 'X' in current subos". Writing it anyway is what produced
+                // doctor's `orphan shim`, an error the user could not fix:
+                // `--fix` deleted the file and the next install recreated it.
+                //
+                // Registration deliberately withholds activation from a release
+                // whose group already has an active member (see
+                // registration.cppm, `activateGroup`), so every name that is new
+                // in that release lands here. The sibling effects below already
+                // guard on activation; this one did not.
+                //
+                // The question is about the NAME, not this version: a second
+                // version of an active program must not delete or skip the shim
+                // its active sibling needs. And a name activated later still
+                // gets its file -- `cmd_use` creates shims for every member of
+                // the release it switches to (xvm/commands.cppm).
+                const auto activeIt = ws.find(resolved->target);
+                const bool nameHasActiveVersion =
+                    activeIt != ws.end()
+                    && !activeIt->second.empty();
+                if (!nameHasActiveVersion) {
+                    log::debug(
+                        "[xim] shim for {}@{} not created: no active version of "
+                        "'{}' in this subos",
+                        resolved->target, effect.version, resolved->target);
+                    continue;
+                }
+                // The file itself is not written here any more.
+                //
+                // `xself::sync_shim_tables()` below derives the whole routing
+                // table from the workspace once the install has finished, which
+                // is what removed the second half of this block: a project-scope
+                // mirror into the global bin that nothing recorded and nothing
+                // could reclaim. Reaching this point still means "this name is
+                // active here", which is exactly what the table will conclude.
+
+                if (resolved->active
+                    && xvm::is_xlings_binary(resolved->target)
+                    && std::filesystem::exists(xlings_bin)
+                    && !resolved->path.empty()
+                    && !resolved->sourceName.empty()) {
+                    auto activeName = resolved->sourceName;
+                    if (!shim_ext.empty()
+                        && !activeName.ends_with(shim_ext)) {
+                        activeName += shim_ext;
+                    }
+                    const auto activeBin =
+                        std::filesystem::path(resolved->path)
+                        / activeName;
+                    if (std::filesystem::exists(activeBin)) {
+                        // The same writer `xlings use xlings <v>` goes through.
+                        // Two independent replacements of the one file every shim
+                        // dispatches through is how a home ends up running a
+                        // client nobody chose -- see entry_binary.cppm.
+                        entry_binary::replace_with(
+                            activeBin, xlings_bin,
+                            std::format("{}@{}", resolved->target, effect.version),
+                            effect.version);
+                    }
+                    xself::compat::v0_4_8::cleanup_legacy_alias_shims(
+                        binDir, xlings_bin);
+                }
+                continue;
+            }
+            if (resolved->kind == XpkgFilesystemEffectKind::FileAsset) {
+                if (!resolved->active) {
+                    log::debug("[xim] file asset {}@{} not placed: not the "
+                               "active version", resolved->target,
+                               resolved->version);
+                    continue;
+                }
+                if (const auto file = xvm::file_placement(
+                        scopedDb, resolved->target, resolved->version,
+                        Config::paths().homeDir.string());
+                    !file.empty()) {
+                    xvm::place_asset(file.source,
+                                     subosDir / file.destination);
+                } else {
+                    log::warn("[xim] file asset {}@{} declares no usable "
+                              "destination; nothing placed",
+                              resolved->target, resolved->version);
+                }
+                continue;
+            }
+            if (resolved->kind != XpkgFilesystemEffectKind::Library
+                || resolved->path.empty()) {
+                continue;
+            }
+            if (!resolved->active) {
+                // Installing a version that does not become active must not
+                // disturb the sysroot. `InstallHeaders` has been gated this way
+                // since 0.4.70; `Library` was not, so installing a second version
+                // of a package overwrote the active version's library while its
+                // headers stayed put -- the sysroot then held a library from one
+                // release beside headers from another, which compiles and fails
+                // at run time. `xlings use` is what moves libraries.
+                log::debug("[xim] library {}@{} not placed: not the active "
+                           "version", resolved->target, resolved->version);
+                continue;
+            }
+
+            const auto source =
+                std::filesystem::path(resolved->path)
+                / resolved->sourceName;
+            const auto destination =
+                libDir / resolved->destinationName;
+            std::filesystem::create_directories(libDir);
+            std::error_code ec;
+            if (std::filesystem::exists(destination, ec)
+                || std::filesystem::is_symlink(destination, ec)) {
+                std::filesystem::remove(destination, ec);
+            }
+            ec.clear();
+            if (std::filesystem::exists(source, ec)) {
+                std::filesystem::create_symlink(
+                    source, destination, ec);
+            }
+        }
+    };
+
+    place_effects_into(artifactSubosDir, scopedWorkspace);
+
+    // A registration rewrite (e.g. `remove` + `install` for the same
+    // version, or a recipe update that changes a release's declared paths)
+    // must not leave every OTHER subos that pins this version with dangling
+    // sysroot links -- the loop above only ever touched the subos this
+    // command is running in. `find_subos_pinning_version` is the same
+    // predicate `xlings remove`'s "pinned by" reporting already uses
+    // (xim/commands.cpp): active OR installed[], either pins the payload
+    // just as hard. It only ever considers `<home>/subos/*` (see
+    // `load_subos_snapshots`), never a project-scoped subos, so resolving
+    // each name against `homeDir / "subos" / name` below matches exactly
+    // what produced it.
+    //
+    // Deliberately NOT `ScopedSubosOverride` / `Config::set_active_subos_
+    // override` here, and not just because xim.commands (which owns the
+    // guard) imports xim.installer, making that a module cycle. Measured
+    // directly: the override's own reload (`Config::reload_state()`, needed
+    // on every transition or `Config::workspace()` reads one subos stale --
+    // see its comment in config.cpp) re-reads `globalVersions_` from
+    // `~/.xlings.json` on disk. That clobbers `scopedDb` -- a REFERENCE to
+    // that same member -- with whatever was there before this call, because
+    // `Config::save_versions()` for THIS batch has not run yet (it happens
+    // once, after this whole loop). The library branch below then resolves
+    // `resolved->path` from the stale pre-batch entry, silently placing
+    // nothing for every other subos while headers still moved (their source
+    // path rides on `effect.sourceDir`, captured before the DB write, not
+    // looked up through `scopedDb`). So: read each other subos's own
+    // workspace file directly -- read-only, and the version DB it is
+    // resolved against stays the one this batch just registered.
+    // `unreadable` names subos this scan could not even open to check --
+    // a subos whose file was already corrupted BEFORE this batch ran, so it
+    // never had the chance to be named as pinning anything (load_subos_
+    // snapshots skips it entirely, per its own doc comment). It might be
+    // the one pinning this exact version -- there is no way to tell -- so
+    // warn about it too, the same way the loop below warns about a file
+    // that turns out unreadable mid-scan.
+    std::vector<std::string> unreadableSubos;
+    auto pinningSubos = xlings::profile::find_subos_pinning_version(
+        Config::paths().homeDir, node.name, node.version, &unreadableSubos);
+    for (const auto& name : unreadableSubos) {
+        if (name == Config::paths().activeSubos) continue;
+        const auto configPath =
+            Config::paths().homeDir / "subos" / name / ".xlings.json";
+        log::warn(
+            "{}: its workspace file ({}) could not be read, so it is not "
+            "known whether it pins {}@{} -- its sysroot was NOT refreshed; "
+            "run `xlings self doctor --subos {}` to repair it",
+            name, configPath.string(), node.name, node.version, name);
+    }
+    for (const auto& otherSubos : pinningSubos) {
+        if (otherSubos == Config::paths().activeSubos) continue;
+        const auto otherSubosDir =
+            Config::paths().homeDir / "subos" / otherSubos;
+        const auto otherSubosConfig = otherSubosDir / ".xlings.json";
+        auto sws = load_workspace_file_checked_(otherSubosConfig);
+        if (!sws) {
+            // `find_subos_pinning_version` just said this subos pins
+            // `node.name`@`node.version`, which only happens by reading a
+            // valid workspace object out of this exact file -- so a failure
+            // reading it again here, moments later, means the file is
+            // unreadable (missing, truncated, invalid JSON), not that the
+            // subos legitimately has an empty workspace. Silently
+            // continuing would leave that subos's sysroot on whatever it
+            // pointed at before -- possibly dangling, per #586 -- with
+            // nothing in the log to say so. `self doctor --subos <name>`
+            // is the same repair `xlings remove`'s cross-subos reporting
+            // already points at for a broken payload; it lands in this
+            // same release.
             log::warn(
-                "validated xvm effect target disappeared or changed kind: "
-                "{}@{}",
-                effect.target, effect.version);
+                "{}: pins {}@{}, but its workspace file could not be read "
+                "({}) -- its sysroot was not refreshed; run `xlings self "
+                "doctor --subos {}` to repair it",
+                otherSubos, node.name, node.version,
+                otherSubosConfig.string(), otherSubos);
             continue;
         }
-        if (resolved->kind
-            == XpkgFilesystemEffectKind::InstallHeaders) {
-            if (!resolved->active) {
-                // Installing a non-active version must not disturb the
-                // sysroot: `xlings use` is what moves headers, and it cannot
-                // undo this because switching to an already-active version
-                // is a no-op.
-                log::debug("[xim] headers for {}@{} not installed: not the "
-                           "active version", resolved->target, resolved->version);
-                continue;
-            }
-            xvm::install_headers(
-                resolved->sourceDir, sysroot_include);
-            continue;
-        }
-        if (resolved->kind
-            == XpkgFilesystemEffectKind::RemoveHeaders) {
-            xvm::remove_headers(
-                resolved->sourceDir, sysroot_include);
-            continue;
-        }
-        if (resolved->kind
-            == XpkgFilesystemEffectKind::ProgramShim) {
-            // A shim is only meaningful for a name that has an active
-            // version -- that is what shim_dispatch resolves against, and
-            // without one the file can only ever print "no active version
-            // of 'X' in current subos". Writing it anyway is what produced
-            // doctor's `orphan shim`, an error the user could not fix:
-            // `--fix` deleted the file and the next install recreated it.
-            //
-            // Registration deliberately withholds activation from a release
-            // whose group already has an active member (see
-            // registration.cppm, `activateGroup`), so every name that is new
-            // in that release lands here. The sibling effects below already
-            // guard on activation; this one did not.
-            //
-            // The question is about the NAME, not this version: a second
-            // version of an active program must not delete or skip the shim
-            // its active sibling needs. And a name activated later still
-            // gets its file -- `cmd_use` creates shims for every member of
-            // the release it switches to (xvm/commands.cppm).
-            const auto activeIt = scopedWorkspace.find(resolved->target);
-            const bool nameHasActiveVersion =
-                activeIt != scopedWorkspace.end()
-                && !activeIt->second.empty();
-            if (!nameHasActiveVersion) {
-                log::debug(
-                    "[xim] shim for {}@{} not created: no active version of "
-                    "'{}' in this subos",
-                    resolved->target, effect.version, resolved->target);
-                continue;
-            }
-            // The file itself is not written here any more.
-            //
-            // `xself::sync_shim_tables()` below derives the whole routing
-            // table from the workspace once the install has finished, which
-            // is what removed the second half of this block: a project-scope
-            // mirror into the global bin that nothing recorded and nothing
-            // could reclaim. Reaching this point still means "this name is
-            // active here", which is exactly what the table will conclude.
-
-            if (resolved->active
-                && xvm::is_xlings_binary(resolved->target)
-                && std::filesystem::exists(xlings_bin)
-                && !resolved->path.empty()
-                && !resolved->sourceName.empty()) {
-                auto activeName = resolved->sourceName;
-                if (!shim_ext.empty()
-                    && !activeName.ends_with(shim_ext)) {
-                    activeName += shim_ext;
-                }
-                const auto activeBin =
-                    std::filesystem::path(resolved->path)
-                    / activeName;
-                if (std::filesystem::exists(activeBin)) {
-                    // The same writer `xlings use xlings <v>` goes through.
-                    // Two independent replacements of the one file every shim
-                    // dispatches through is how a home ends up running a
-                    // client nobody chose -- see entry_binary.cppm.
-                    entry_binary::replace_with(
-                        activeBin, xlings_bin,
-                        std::format("{}@{}", resolved->target, effect.version),
-                        effect.version);
-                }
-                xself::compat::v0_4_8::cleanup_legacy_alias_shims(
-                    artifactBinDir, xlings_bin);
-            }
-            continue;
-        }
-        if (resolved->kind == XpkgFilesystemEffectKind::FileAsset) {
-            if (!resolved->active) {
-                log::debug("[xim] file asset {}@{} not placed: not the "
-                           "active version", resolved->target,
-                           resolved->version);
-                continue;
-            }
-            if (const auto file = xvm::file_placement(
-                    scopedDb, resolved->target, resolved->version,
-                    Config::paths().homeDir.string());
-                !file.empty()) {
-                xvm::place_asset(file.source,
-                                 artifactSubosDir / file.destination);
-            } else {
-                log::warn("[xim] file asset {}@{} declares no usable "
-                          "destination; nothing placed",
-                          resolved->target, resolved->version);
-            }
-            continue;
-        }
-        if (resolved->kind != XpkgFilesystemEffectKind::Library
-            || resolved->path.empty()) {
-            continue;
-        }
-        if (!resolved->active) {
-            // Installing a version that does not become active must not
-            // disturb the sysroot. `InstallHeaders` has been gated this way
-            // since 0.4.70; `Library` was not, so installing a second version
-            // of a package overwrote the active version's library while its
-            // headers stayed put -- the sysroot then held a library from one
-            // release beside headers from another, which compiles and fails
-            // at run time. `xlings use` is what moves libraries.
-            log::debug("[xim] library {}@{} not placed: not the active "
-                       "version", resolved->target, resolved->version);
-            continue;
-        }
-
-        const auto source =
-            std::filesystem::path(resolved->path)
-            / resolved->sourceName;
-        const auto destination =
-            sysroot_lib / resolved->destinationName;
-        std::filesystem::create_directories(sysroot_lib);
-        std::error_code ec;
-        if (std::filesystem::exists(destination, ec)
-            || std::filesystem::is_symlink(destination, ec)) {
-            std::filesystem::remove(destination, ec);
-        }
-        ec.clear();
-        if (std::filesystem::exists(source, ec)) {
-            std::filesystem::create_symlink(
-                source, destination, ec);
-        }
+        place_effects_into(otherSubosDir, sws->active);
     }
 
     cleanup_removed_xvm_program_artifacts(
@@ -3223,7 +3444,7 @@ std::expected<void, std::string> Installer::execute(const InstallPlan& plan, con
 }
 
 
-std::expected<Installer::UninstallOutcome, std::string> Installer::uninstall(const std::string& name) {
+std::expected<Installer::UninstallOutcome, std::string> Installer::uninstall(const std::string& name, bool force) {
     auto platform = detect_platform_();
     auto currentWorkspacePath = detail_::current_workspace_config_path_();
 
@@ -3252,15 +3473,74 @@ std::expected<Installer::UninstallOutcome, std::string> Installer::uninstall(con
     std::filesystem::path pkgFile;
     std::filesystem::path installDir;
     std::optional<PackageMatch> resolvedMatch;
+    // True when no index could resolve a recipe at all -- the version
+    // record and its payload are the only evidence left, and removal has
+    // to work from those instead of refusing (openxlings/xlings#578 and the
+    // maintainer's "remove --all --force must always work").
+    bool recipeUnavailable = false;
+    // The record's OWN provider/providerVersion (its bindingGroup, when it
+    // has one) -- read here because there is no PackageMatch to derive it
+    // from below. A record installed through a namespaced index writes a
+    // provider like "xim:plain", not the bare target name; presenting the
+    // bare name as the executing provider to snapshot_xpkg_removal_context
+    // reads as a DIFFERENT provider trying to remove someone else's version
+    // ("selected version is owned by provider 'xim:plain', not 'plain'").
+    std::string recipeUnavailableProvider;
+    std::string recipeUnavailableProviderVersion;
 
     if (catalog_) {
         auto match = catalog_->resolve_target(resolvedTarget, platform);
-        if (!match) return std::unexpected(match.error());
-        resolvedMatch = *match;
-        pkgFile = match->pkgFile;
-        installDir = (match->storeRoot.empty() ? (Config::paths().dataDir / "xpkgs") : match->storeRoot)
-            / detail_::effective_store_name_(*match)
-            / match->version;
+        if (match) {
+            resolvedMatch = *match;
+            pkgFile = match->pkgFile;
+            installDir = (match->storeRoot.empty() ? (Config::paths().dataDir / "xpkgs") : match->storeRoot)
+                / detail_::effective_store_name_(*match)
+                / match->version;
+        } else {
+            // The recipe is gone from every index the catalog knows about --
+            // deleted upstream, an index repo pointed elsewhere, whatever.
+            // The version record and the payload it names both outlive the
+            // recipe that wrote them. Read the identity from what the
+            // installer already wrote instead of asking a recipe that is no
+            // longer there to re-derive it.
+            const auto& db = Config::versions_mut();
+            const auto* vinfo = xvm::get_vinfo(db, targetName);
+            std::string dbVersion = requestedVersion;
+            if (dbVersion.empty() && vinfo && vinfo->versions.size() == 1) {
+                // Only when unambiguous. A caller with several versions and
+                // no version pinned has to say which one; cmd_remove is
+                // where that ambiguity gets surfaced to the user.
+                dbVersion = vinfo->versions.begin()->first;
+            }
+            const xvm::VData* vdata = (vinfo && !dbVersion.empty())
+                ? xvm::get_vdata(db, targetName, dbVersion)
+                : nullptr;
+            std::optional<std::filesystem::path> derivedInstallDir;
+            if (vdata) {
+                derivedInstallDir = detail_::store_version_dir_from_recorded_path_(
+                    xvm::expand_path(vdata->path, Config::paths().homeDir.string()),
+                    Config::paths().dataDir);
+            }
+            if (!derivedInstallDir) {
+                // Genuinely nothing to go on: no recipe, no record. The
+                // catalog's own "not found" is still the right message.
+                return std::unexpected(match.error());
+            }
+            recipeUnavailable = true;
+            requestedVersion  = dbVersion;
+            installDir        = *derivedInstallDir;
+            if (vdata->bindingGroup) {
+                recipeUnavailableProvider = vdata->bindingGroup->provider;
+                recipeUnavailableProviderVersion =
+                    vdata->bindingGroup->providerVersion;
+            }
+            if (recipeUnavailableProvider.empty()) {
+                recipeUnavailableProvider = targetName;
+            }
+            if (recipeUnavailableProviderVersion.empty()) {
+                recipeUnavailableProviderVersion = dbVersion;
+            }
+        }
     } else {
         auto* entry = index_->find_entry(name);
         if (!entry) {
@@ -3277,7 +3557,7 @@ std::expected<Installer::UninstallOutcome, std::string> Installer::uninstall(con
                 resolvedMatch->namespaceName,
                 resolvedMatch->name)
             : resolvedMatch->canonicalName)
-        : targetName;
+        : (recipeUnavailable ? recipeUnavailableProvider : targetName);
     auto detachVersion = resolvedMatch ? resolvedMatch->version : requestedVersion;
     if (resolvedMatch) {
         // The spelling the records were WRITTEN with, not the one today's
@@ -3297,7 +3577,8 @@ std::expected<Installer::UninstallOutcome, std::string> Installer::uninstall(con
     }
     auto executingProviderVersion = resolvedMatch
         ? resolvedMatch->version
-        : xvm::strip_namespace(detachVersion);
+        : (recipeUnavailable ? recipeUnavailableProviderVersion
+                             : xvm::strip_namespace(detachVersion));
 
     auto removalSnapshot = snapshot_xpkg_removal_context(
         Config::versions_mut(), Config::workspace(), {},
@@ -3355,7 +3636,8 @@ std::expected<Installer::UninstallOutcome, std::string> Installer::uninstall(con
             resolvedMatch ? resolvedMatch->scope : PackageScope::Global,
             detachTarget,
             detachVersion,
-            currentWorkspacePath);
+            currentWorkspacePath,
+            force);
 
     if (stillReferenced) {
         detail_::detach_current_subos_(detachTarget, detachVersion);
@@ -3370,67 +3652,91 @@ std::expected<Installer::UninstallOutcome, std::string> Installer::uninstall(con
         };
     }
 
-    auto executorPkgFile = detail_::uninstall_xpkg_file_(pkgFile, installDir);
-    if (executorPkgFile != pkgFile) {
-        log::debug("using xpkg snapshot for uninstall: {}", executorPkgFile.string());
-    }
-
-    auto execResult = mcpplibs::xpkg::create_executor(executorPkgFile);
-    if (!execResult) {
-        return std::unexpected(execResult.error());
-    }
-
-    auto& executor = *execResult;
-    executor.set_log_level(std::string(log::level_string()));
-
     mcpplibs::xpkg::ExecutionContext ctx;
-    ctx.pkg_name = resolvedMatch ? resolvedMatch->name : name;
-    ctx.version = resolvedMatch ? resolvedMatch->version : std::string{};
     ctx.platform = platform;
+    // Independent of whether a recipe was found: this is purely
+    // Config::xvm_artifact_subos_dir(), and the cleanup passes below (shim
+    // sync, subos env section, headers) need it regardless of the recipe.
     const auto artifactSubosDir =
-        detail_::configure_xpkg_execution_artifact_paths_(
-            ctx);
-    auto selectedStore = resolvedMatch
-        ? (resolvedMatch->storeRoot.empty()
-            ? Config::paths().dataDir / "xpkgs"
-            : resolvedMatch->storeRoot)
-        : Config::paths().dataDir / "xpkgs";
-    detail_::configure_dependency_store_roots_(ctx, selectedStore);
-    ctx.install_dir = installDir;
-    ctx.xpkg_dir = pkgFile.parent_path();
-    ctx.pkgindex_dir = detail_::pkgindex_root_for_(pkgFile);
+        detail_::configure_xpkg_execution_artifact_paths_(ctx);
 
-    bool useDefaultRemoval = false;
-    if (executor.has_hook(mcpplibs::xpkg::HookType::Uninstall)) {
-        log::debug("uninstalling {}...", name);
-        auto result = executor.run_hook(
-            mcpplibs::xpkg::HookType::Uninstall, ctx);
-        if (!result.success) {
-            return std::unexpected(
-                detail_::format_hook_failure("uninstall", result));
+    bool useDefaultRemoval = recipeUnavailable;
+    std::string hookFailure;
+    std::vector<mcpplibs::xpkg::XvmOp> xvm_ops;
+
+    if (!recipeUnavailable) {
+        auto executorPkgFile = detail_::uninstall_xpkg_file_(pkgFile, installDir);
+        if (executorPkgFile != pkgFile) {
+            log::debug("using xpkg snapshot for uninstall: {}", executorPkgFile.string());
         }
+
+        auto execResult = mcpplibs::xpkg::create_executor(executorPkgFile);
+        if (!execResult) {
+            return std::unexpected(execResult.error());
+        }
+
+        auto& executor = *execResult;
+        executor.set_log_level(std::string(log::level_string()));
+
+        ctx.pkg_name = resolvedMatch ? resolvedMatch->name : name;
+        ctx.version = resolvedMatch ? resolvedMatch->version : std::string{};
+        auto selectedStore = resolvedMatch
+            ? (resolvedMatch->storeRoot.empty()
+                ? Config::paths().dataDir / "xpkgs"
+                : resolvedMatch->storeRoot)
+            : Config::paths().dataDir / "xpkgs";
+        detail_::configure_dependency_store_roots_(ctx, selectedStore);
+        ctx.install_dir = installDir;
+        ctx.xpkg_dir = pkgFile.parent_path();
+        ctx.pkgindex_dir = detail_::pkgindex_root_for_(pkgFile);
+
+        if (executor.has_hook(mcpplibs::xpkg::HookType::Uninstall)) {
+            log::debug("uninstalling {}...", name);
+            auto result = executor.run_hook(
+                mcpplibs::xpkg::HookType::Uninstall, ctx);
+            if (!result.success) {
+                // The recipe's own cleanup failed. Before this change that
+                // was fatal HERE, before the version DB entry, the
+                // workspace binding, the shim or the payload had been
+                // touched -- a thrown uninstall() left the package
+                // registered as installed with no way to retry it (the
+                // next `install` sees the payload and skips straight past
+                // config()). Record the failure and keep going: withdrawal
+                // below runs regardless, and the caller (cmd_remove)
+                // decides whether "state withdrawn, hook unhappy" is enough
+                // to call this a success.
+                hookFailure = detail_::format_hook_failure("uninstall", result);
+                useDefaultRemoval = true;
+            }
+        } else {
+            // Check if this is a script-type or subos-type package and run default uninstall
+            bool isScriptType = false;
+            bool isSubosType  = false;
+            if (catalog_ && resolvedMatch) {
+                auto pkg = catalog_->load_package(*resolvedMatch);
+                if (pkg) {
+                    isScriptType = (pkg->type == mcpplibs::xpkg::PackageType::Script);
+                    isSubosType  = (pkg->type == mcpplibs::xpkg::PackageType::Subos);
+                }
+            } else if (index_) {
+                auto* entry = index_->find_entry(targetName);
+                if (entry) {
+                    isScriptType = (entry->type == mcpplibs::xpkg::PackageType::Script);
+                    isSubosType  = (entry->type == mcpplibs::xpkg::PackageType::Subos);
+                }
+            }
+            useDefaultRemoval = isScriptType || isSubosType;
+        }
+
+        xvm_ops = executor.xvm_operations();
     } else {
-        // Check if this is a script-type or subos-type package and run default uninstall
-        bool isScriptType = false;
-        bool isSubosType  = false;
-        if (catalog_ && resolvedMatch) {
-            auto pkg = catalog_->load_package(*resolvedMatch);
-            if (pkg) {
-                isScriptType = (pkg->type == mcpplibs::xpkg::PackageType::Script);
-                isSubosType  = (pkg->type == mcpplibs::xpkg::PackageType::Subos);
-            }
-        } else if (index_) {
-            auto* entry = index_->find_entry(targetName);
-            if (entry) {
-                isScriptType = (entry->type == mcpplibs::xpkg::PackageType::Script);
-                isSubosType  = (entry->type == mcpplibs::xpkg::PackageType::Subos);
-            }
-        }
-        useDefaultRemoval = isScriptType || isSubosType;
+        log::info("{}: no index provides its recipe anymore; withdrawing its "
+                  "registration and payload directly", detachTarget);
     }
 
-    // Process xvm operations collected by uninstall hook
-    auto xvm_ops = executor.xvm_operations();
+    // Process xvm operations collected by the uninstall hook, or synthesise
+    // the default removal op when there was no hook to ask (script/subos
+    // type, or no recipe at all), or the one there was threw.
     if (useDefaultRemoval) {
         xvm_ops.push_back({
             .op = "remove",
@@ -3617,9 +3923,11 @@ std::expected<Installer::UninstallOutcome, std::string> Installer::uninstall(con
 
     log::debug("{} uninstalled", resolvedTarget);
     return UninstallOutcome{
-        .detachedOnly = false,
-        .target       = detachTarget,
-        .version      = detachVersion,
+        .detachedOnly      = false,
+        .target            = detachTarget,
+        .version           = detachVersion,
+        .hookFailure       = hookFailure,
+        .recipeUnavailable = recipeUnavailable,
     };
 }
 

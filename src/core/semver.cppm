@@ -113,6 +113,16 @@ inline std::optional<Version> parse(std::string_view s) {
     Version v;
     v.raw = std::string(s);
 
+    // Drop build metadata: everything from the first '+' on. SemVer says it
+    // carries no precedence, and a key like `25.0.4+7` (Temurin's own
+    // spelling) must still be a version -- before this, the '+' failed the
+    // field charset, the real key was invisible to every range, and a range
+    // resolved to the ALIAS `25.0.4` that named it (#590).
+    if (auto plus = s.find('+'); plus != std::string_view::npos) {
+        s = s.substr(0, plus);
+        if (s.empty()) return std::nullopt;
+    }
+
     // Split off prerelease: everything after the first '-' that follows at
     // least one digit. "gcc-15" has no digit before the dash and stays whole
     // (and then fails the field charset, as a name should).

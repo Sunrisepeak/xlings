@@ -22,7 +22,7 @@ Options: `-g, --global` — Use global scope; `-u, --use` — Activate installed
 
 Remove a package
 
-Options: `-g, --global` — Use global scope; `--force` — Remove even if installed packages depend on it
+Options: `-g, --global` — Use global scope; `--force` — Remove even if packages depend on it, the recipe is gone, or its uninstall hook fails; `--all` — Remove every installed version, not just the active one; `--all-subos` — Remove from every subos that has it installed; `--subos <NAME>` — Act on this subos only, instead of the current one
 
 ## `xlings update [package] [version]`
 
@@ -58,7 +58,7 @@ Options: `-a, --all` — Show every subos; `--strict` — Require a coherent rel
 
 Show or modify configuration
 
-Options: `--lang <LANG>` — Set language; `--mirror <MIRROR>` — Set mirror; `--ui-mode <MODE>` — Set UI mode (cli/tui/auto); `--theme <THEME>` — Set colour theme (name, path, or list); `--interactive <BOOL>` — Inline prompts in tui mode; `--add-xpkg <FILE>` — Add package recipe; `--index-repo <NS:URL>` — Add index repository
+Options: `--lang <LANG>` — Set language; `--mirror <MIRROR>` — Set mirror; `--ui-mode <MODE>` — Set UI mode (cli/tui/auto); `--theme <THEME>` — Set colour theme (name, path, or list); `--interactive <BOOL>` — Inline prompts in tui mode; `--add-xpkg <FILE>` — Add package recipe; `--list-xpkg` — List local recipes and how they relate to the synced index; `--remove-xpkg <NAME>` — Remove one local recipe; `--clear-xpkg <all|stale>` — Remove local recipes (all, or stale = identical/behind the synced index); `--index-repo <NS:URL>` — Add index repository
 
 ## `xlings subos`
 
@@ -136,7 +136,7 @@ Migrate old layout
 
 Verify installation
 
-Options: `--deep` — Audit package payloads and runtime functionality; `--scope <PACKAGE[@VERSION]>` — Limit deep payload/runtime audit to one local package coordinate; `--fix` — Repair (implies --deep); `--dry-run` — Preview repairs without changing detection depth; `--all` — Show all findings; `--reset-metadata` — Discard unreadable metadata
+Options: `--deep` — Audit package payloads and runtime functionality; `--scope <PACKAGE[@VERSION]>` — Limit deep payload/runtime audit to one local package coordinate; `--subos <NAME>` — Check/repair one specific subos instead of the active one; `--fix` — Repair (implies --deep; walks every subos that owns a finding); `--dry-run` — Preview repairs without changing detection depth; `--show-ok` — Show all findings, including non-defects; `--all` — Deprecated alias for --show-ok; `--reset-metadata` — Discard unreadable metadata
 
 ## `xlings script <script-file> [args]...`
 

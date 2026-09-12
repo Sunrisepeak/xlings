@@ -13,7 +13,6 @@ import xlings.libs.json;
 import xlings.core.semver;
 import xlings.core.entry_binary;
 import xlings.core.xself;
-import xlings.core.xself.repair;
 import xlings.core.xvm.types;
 import xlings.core.xvm.db;
 import xlings.core.xvm.lock;
@@ -970,8 +969,6 @@ int cmd_use(const std::string& target, const std::string& version, EventStream& 
                   plan->toProvider);
     }
 
-    xself::print_migration_hint_once(Config::recorded_client_version(),
-                                     Info::VERSION);
     return 0;
 }
 

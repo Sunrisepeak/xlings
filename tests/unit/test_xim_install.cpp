@@ -198,6 +198,53 @@ TEST(XimCommandsTest, SearchNonexistentReturnsZero) {
     EXPECT_EQ(rc, 0);  // returns 0 with "no packages found" message
 }
 
+// ------------------------------------------------- ScopedSubosOverride
+//
+// `cmd_remove`'s --subos/--all-subos loop switches Config's active-subos
+// override (and its XLINGS_ACTIVE_SUBOS twin) for the duration of one
+// removal, then must restore both. A code-review-caught bug: restoring the
+// override BEFORE the env var made `set_active_subos_override("")` (the
+// common case -- there was no override before the switch) fall through to
+// reading XLINGS_ACTIVE_SUBOS, which the guard was STILL holding at the
+// subos it was leaving -- so `Config::paths().activeSubos` came back wrong
+// after the very first switch. These tests exercise the guard directly
+// (no XLINGS_HOME is set up; Config's ambient home is whatever the process
+// resolves, and the guard is read-only against it -- it only ever flips
+// which subos name is "current", never writes anything).
+TEST(XimCommandsTest, ScopedSubosOverrideRestoresActiveSubosOnDestruction) {
+    const auto before = xlings::Config::paths().activeSubos;
+    {
+        xlings::xim::ScopedSubosOverride scope("xlings-scoped-subos-probe");
+        EXPECT_EQ(xlings::Config::paths().activeSubos,
+                 "xlings-scoped-subos-probe");
+    }
+    EXPECT_EQ(xlings::Config::paths().activeSubos, before)
+        << "destruction must restore the subos active before the guard, not "
+           "leave it on the one it switched to (the empty-override fallback "
+           "reads XLINGS_ACTIVE_SUBOS, which must already be back by then)";
+}
+
+TEST(XimCommandsTest, ScopedSubosOverrideNestsBackToTheOuterSubos) {
+    const auto before = xlings::Config::paths().activeSubos;
+    xlings::xim::ScopedSubosOverride outer("xlings-scoped-subos-outer");
+    ASSERT_EQ(xlings::Config::paths().activeSubos, "xlings-scoped-subos-outer");
+    {
+        xlings::xim::ScopedSubosOverride inner("xlings-scoped-subos-inner");
+        EXPECT_EQ(xlings::Config::paths().activeSubos,
+                 "xlings-scoped-subos-inner");
+    }
+    EXPECT_EQ(xlings::Config::paths().activeSubos, "xlings-scoped-subos-outer")
+        << "the inner guard must restore to the OUTER override, not to "
+           "whatever was active before either guard";
+    (void)before;
+}
+
+TEST(XimCommandsTest, ScopedSubosOverrideEmptyNameIsANoOp) {
+    const auto before = xlings::Config::paths().activeSubos;
+    xlings::xim::ScopedSubosOverride scope("");
+    EXPECT_EQ(xlings::Config::paths().activeSubos, before);
+}
+
 TEST(XimInventoryOwnerTest, CanonicalFilterKeepsUniqueLegacyBareRecord) {
     xlings::xvm::VersionDB db;
     db["gcc"].versions["16.1.0"].kind = "program";

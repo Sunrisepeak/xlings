@@ -4,6 +4,7 @@ import std;
 import mcpplibs.xpkg;
 import xlings.core.config;
 import xlings.core.log;
+import xlings.core.notice;
 import xlings.core.xim.payload;
 import xlings.core.xim.index;
 import xlings.core.xim.repo;
@@ -86,6 +87,35 @@ ParsedPackageTarget parse_package_target(std::string target) {
 
 namespace detail_ {
 
+// Every version key of one platform table with aliases followed to what they
+// name, "latest" excluded, duplicates collapsed. The result is the set of
+// versions that can exist as a store directory.
+std::vector<std::string> concrete_versions_(
+    const std::unordered_map<std::string, xpkg::PlatformResource>& versions) {
+    std::vector<std::string> out;
+    std::unordered_set<std::string> seen;
+    for (const auto& [ver, entry] : versions) {
+        if (ver == "latest") continue;
+        std::string concrete = entry.ref.empty() ? ver : entry.ref;
+        // Follow a CHAIN of aliases to its end, not just its first link.
+        // "8" -> ref "8.0" -> ref "8.0.1" used to stop after one hop, so
+        // ">=8" answered with "8.0" -- itself just another name, never a
+        // directory the store created. Bounded (8 hops) and cycle-safe: a
+        // hand-edited or malformed index that points two aliases at each
+        // other must fail closed (stop and use the last string reached),
+        // not loop forever.
+        std::unordered_set<std::string> visited{ver};
+        for (int hop = 0; hop < 8; ++hop) {
+            if (!visited.insert(concrete).second) break;  // cycle
+            auto it = versions.find(concrete);
+            if (it == versions.end() || it->second.ref.empty()) break;
+            concrete = it->second.ref;
+        }
+        if (seen.insert(concrete).second) out.push_back(concrete);
+    }
+    return out;
+}
+
 std::string select_version_(const xpkg::Package& pkg,
                             const std::string& platform,
                             const std::string& versionHint) {
@@ -99,12 +129,16 @@ std::string select_version_(const xpkg::Package& pkg,
         if (directIt != versions.end()) {
             return directIt->second.ref.empty() ? versionHint : directIt->second.ref;
         }
-        // Semver range/prefix matching against available versions
-        std::vector<std::string> available;
-        for (auto& [ver, _] : versions) {
-            if (ver != "latest") available.push_back(ver);
-        }
-        return semver::select_best(available, versionHint);
+        // Semver range/prefix matching against CONCRETE versions only.
+        //
+        // An alias entry (`["25.0.4"] = { ref = "25.0.4+7" }`) is a name for
+        // another key, not a version that exists on disk. The exact-match
+        // branch above has always dereferenced it; this branch used to hand
+        // every key to the range matcher, so `>=11` could pick the alias
+        // string itself and `dep_install_dir` then named a directory that was
+        // never installed (#590). Dereference here too, so both branches
+        // answer with a key the store can hold.
+        return semver::select_best(concrete_versions_(versions), versionHint);
     }
 
     // No hint: resolve "latest" ref or pick highest
@@ -113,10 +147,7 @@ std::string select_version_(const xpkg::Package& pkg,
         return latestIt->second.ref;
     }
 
-    std::vector<std::string> available;
-    for (auto& [ver, _] : versions) {
-        if (ver != "latest") available.push_back(ver);
-    }
+    auto available = concrete_versions_(versions);
     if (!available.empty()) {
         semver::sort_desc(available);
         return available[0];
@@ -179,13 +210,15 @@ NamespaceRankResult_ prefer_namespace_rank_(
         if (namespace_rank_(match.namespaceName) == best) {
             out.kept.push_back(match);
         } else {
-            // Same rule as announce_demotion_: no version, no `@`. This string
-            // is printed as a command the user can copy, and
-            // `xlings install local:binutils@` is not one.
-            out.demoted.push_back(
-                match.version.empty()
+            // Same rule as demotion_notice: no version, no `@`. `coordinate`
+            // is printed as a command the user can copy, and `xlings install
+            // local:binutils@` is not one.
+            out.demoted.push_back({
+                .coordinate = match.version.empty()
                     ? match.canonicalName
-                    : std::format("{}@{}", match.canonicalName, match.version));
+                    : std::format("{}@{}", match.canonicalName, match.version),
+                .version = match.version,
+            });
         }
     }
     return out;
@@ -540,16 +573,38 @@ std::vector<PackageMatch> PackageCatalog::prefer_project_scope_(std::vector<Pack
     return detail_::prefer_project_scope_(std::move(matches));
 }
 
-void PackageCatalog::announce_demotion_(const std::string& target,
-                            const PackageMatch& chosen) const {
-    if (chosen.demoted.empty()) return;
+namespace detail_ {
+
+std::optional<DemotionVerdict> demotion_verdict(const std::string& target,
+                                                const PackageMatch& chosen) {
+    if (chosen.demoted.empty()) return std::nullopt;
+
+    // A `local:` copy at the exact version the index already has is not a
+    // conflict -- it is the common case on a dev machine, and announcing it
+    // on every command would be exactly the noise this rule exists to
+    // remove. Only a REAL alternative (a different version) is worth a
+    // word.
+    const bool allDuplicates = std::ranges::all_of(
+        chosen.demoted,
+        [&](const auto& d) { return d.version == chosen.version; });
+    if (allDuplicates) return std::nullopt;
+
     std::string losers;
-    for (const auto& name : chosen.demoted) {
+    for (const auto& d : chosen.demoted) {
         if (!losers.empty()) losers += ", ";
-        losers += name;
+        losers += d.coordinate;
     }
-    auto key = target + "\x1f" + chosen.canonicalName + "\x1f" + losers;
-    if (!demotionsAnnounced_.insert(key).second) return;
+    return DemotionVerdict{
+        .fingerprint = target + "\x1f" + chosen.canonicalName + "\x1f" + losers,
+        .losers = losers,
+    };
+}
+
+bool demotion_notice(const std::string& target, const PackageMatch& chosen,
+                     const notice::Memo& memo) {
+    auto verdict = demotion_verdict(target, chosen);
+    if (!verdict) return false;
+
     // `@version` only when there IS one. The identity-only path
     // (resolve_local_identity, used by inventory) does not select a
     // version, so unconditional formatting printed `local:binutils@` --
@@ -561,12 +616,32 @@ void PackageCatalog::announce_demotion_(const std::string& target,
                                 const std::string& version) {
         return version.empty() ? name : name + "@" + version;
     };
-    log::warn("'{}' also provided by {}; selected {} by namespace "
-              "priority (local ranks last)",
-              target, losers,
-              withVersion(chosen.canonicalName, chosen.version));
-    log::warn("  to pick the other: use its full name, e.g. `{}`",
-              chosen.demoted.front());
+    return notice::notice_once(memo, "catalog.demoted", verdict->fingerprint, {
+        .code    = "xim.namespace_priority",
+        .summary = std::format(
+            "'{}' also provided by {}; selected {} by namespace "
+            "priority (local ranks last)",
+            target, verdict->losers,
+            withVersion(chosen.canonicalName, chosen.version)),
+        .actions = { { "pick the other",
+                      std::format("xlings install {}",
+                                  chosen.demoted.front().coordinate) } },
+    });
+}
+
+}  // namespace detail_
+
+void PackageCatalog::announce_demotion_(const std::string& target,
+                            const PackageMatch& chosen) const {
+    auto verdict = detail_::demotion_verdict(target, chosen);
+    if (!verdict) return;
+    // Fast in-process gate before the persisted one: `resolve_target` has
+    // sixteen callers and several resolve the same target twice in one run
+    // (planner, then installer) -- this skips the home-config read
+    // `notice::notice_once`'s Memo does for what is, within one process,
+    // obviously the same announcement.
+    if (!demotionsAnnounced_.insert(verdict->fingerprint).second) return;
+    detail_::demotion_notice(target, chosen, notice::config_memo());
 }
 
 namespace detail_ {

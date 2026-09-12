@@ -39,6 +39,7 @@ import xlings.core.xvm.switch_plan;
 import xlings.core.xvm.shim;
 import xlings.core.xvm.commands;
 import xlings.core.compact;
+import xlings.core.notice;
 import xlings.core.config;
 import xlings.core.home_config;
 import xlings.platform;
@@ -858,7 +859,8 @@ TEST(XimNamespacePriorityTest, LocalLosesABareNameAndIsNamed) {
     // The demotion is DATA, not just a log line: a pick nobody can see is the
     // thing this rule must not become.
     ASSERT_EQ(got->demoted.size(), 1u);
-    EXPECT_EQ(got->demoted.front(), "local:xlings@0.4.51");
+    EXPECT_EQ(got->demoted.front().coordinate, "local:xlings@0.4.51");
+    EXPECT_EQ(got->demoted.front().version, "0.4.51");
 }
 
 TEST(XimNamespacePriorityTest, AnExplicitlyQualifiedLocalTargetIsUntouched) {
@@ -904,4 +906,204 @@ TEST(XimNamespacePriorityTest, LocalAloneStillResolves) {
     ASSERT_TRUE(got.has_value()) << got.error();
     EXPECT_EQ(got->canonicalName, "local:mytool");
     EXPECT_TRUE(got->demoted.empty());
+}
+
+// ── demotion verdict: one rule, shared by the gate and the notice ─────────
+//
+// `detail_::demotion_verdict` is the single place that decides "is every
+// demoted candidate a duplicate of the version already chosen" and builds
+// the fingerprint/`losers` string from it -- both `announce_demotion_`'s
+// in-process gate and `demotion_notice`'s persisted one call it rather than
+// each recomputing the same three lines (review finding: they used to).
+
+TEST(XimDemotionVerdict, SameVersionIsNullopt) {
+    xlings::xim::PackageMatch chosen;
+    chosen.canonicalName = "xim:xlings";
+    chosen.version = "0.4.51";
+    chosen.demoted = { { "local:xlings@0.4.51", "0.4.51" } };
+
+    EXPECT_FALSE(xlings::xim::detail_::demotion_verdict("xlings", chosen)
+                     .has_value())
+        << "every demoted candidate is the version already chosen: nothing "
+           "to verdict";
+}
+
+TEST(XimDemotionVerdict, NoDemotedCandidatesIsNullopt) {
+    xlings::xim::PackageMatch chosen;
+    chosen.canonicalName = "xim:xlings";
+    chosen.version = "2026.8.11.1";
+
+    EXPECT_FALSE(xlings::xim::detail_::demotion_verdict("xlings", chosen)
+                     .has_value());
+}
+
+TEST(XimDemotionVerdict, MixedVersionsProducesFingerprintAndLosers) {
+    xlings::xim::PackageMatch chosen;
+    chosen.canonicalName = "xim:xlings";
+    chosen.version = "2026.8.11.1";
+    chosen.demoted = { { "local:xlings@0.4.51", "0.4.51" } };
+
+    auto verdict = xlings::xim::detail_::demotion_verdict("xlings", chosen);
+    ASSERT_TRUE(verdict.has_value());
+    EXPECT_EQ(verdict->losers, "local:xlings@0.4.51");
+    EXPECT_EQ(verdict->fingerprint, "xlings\x1f" "xim:xlings\x1f" "local:xlings@0.4.51");
+}
+
+// ── demotion notice: a pure duplicate is not a conflict ───────────────────
+//
+// `local:xlings@0.4.51` sitting next to `xim:xlings@0.4.51` is the ordinary
+// shape of a dev machine, not a namespace conflict: the version is
+// identical, so there is nothing to pick between. `detail_::demotion_notice`
+// is the free function behind `announce_demotion_`'s decision, with an
+// injected `notice::Memo` so it is testable without a home -- see
+// tests/unit/test_notice.cpp for the same shape of fake.
+
+namespace {
+
+struct CountingMemo {
+    int markCalls = 0;
+    std::set<std::string, std::less<>> seenKeys;
+
+    xlings::notice::Memo memo() {
+        return xlings::notice::Memo{
+            .seen = [this](std::string_view id) { return seenKeys.contains(id); },
+            .mark = [this](std::string_view id) {
+                ++markCalls;
+                seenKeys.emplace(id);
+            },
+        };
+    }
+};
+
+}  // namespace
+
+TEST(XimDemotionNotice, DuplicateLocalCopyIsSilent) {
+    xlings::xim::PackageMatch chosen;
+    chosen.canonicalName = "xim:xlings";
+    chosen.version = "0.4.51";
+    chosen.demoted = { { "local:xlings@0.4.51", "0.4.51" } };
+
+    CountingMemo counting;
+    auto memo = counting.memo();
+
+    EXPECT_FALSE(xlings::xim::detail_::demotion_notice("xlings", chosen, memo))
+        << "same version as the one chosen: nothing to report";
+    EXPECT_EQ(counting.markCalls, 0)
+        << "a pure duplicate must not even be remembered as announced";
+}
+
+TEST(XimDemotionNotice, BehindLocalCopyNotesOnce) {
+    xlings::xim::PackageMatch chosen;
+    chosen.canonicalName = "xim:xlings";
+    chosen.version = "2026.8.11.1";
+    chosen.demoted = { { "local:xlings@0.4.51", "0.4.51" } };
+
+    CountingMemo counting;
+    auto memo = counting.memo();
+
+    EXPECT_TRUE(xlings::xim::detail_::demotion_notice("xlings", chosen, memo))
+        << "a real alternative (different version) is worth a word";
+    EXPECT_EQ(counting.markCalls, 1);
+
+    // Same target, same chosen, same losers -- the Memo already has this
+    // fingerprint, so the second call must say nothing.
+    EXPECT_FALSE(xlings::xim::detail_::demotion_notice("xlings", chosen, memo));
+    EXPECT_EQ(counting.markCalls, 1);
+}
+
+// ============================================================
+// #590 — a version alias is a name for another key, not a version that
+// exists on disk. Range and no-hint selection must answer with the key the
+// store can hold; the exact-match branch has always dereferenced it.
+// ============================================================
+
+namespace {
+
+mcpplibs::xpkg::Package aliased_jdk_() {
+    mcpplibs::xpkg::Package pkg;
+    pkg.name = "jdk-temurin";
+    pkg.spec = "1";
+    mcpplibs::xpkg::PlatformResource real;
+    real.url = "https://example.com/jdk-25.0.4+7.tar.gz";
+    mcpplibs::xpkg::PlatformResource alias;
+    alias.ref = "25.0.4+7";
+    mcpplibs::xpkg::PlatformResource latest;
+    latest.ref = "25.0.4+7";
+    pkg.xpm.entries["linux"]["25.0.4+7"] = real;
+    pkg.xpm.entries["linux"]["25.0.4"] = alias;
+    pkg.xpm.entries["linux"]["latest"] = latest;
+    return pkg;
+}
+
+}  // namespace
+
+TEST(XimSelectVersionAlias, RangeHintNeverPicksAnAliasKey) {
+    const auto pkg = aliased_jdk_();
+    EXPECT_EQ(xlings::xim::detail_::select_version_(pkg, "linux", ">=11"),
+              "25.0.4+7");
+    EXPECT_EQ(xlings::xim::detail_::select_version_(pkg, "linux", "^25"),
+              "25.0.4+7");
+}
+
+TEST(XimSelectVersionAlias, ExactAliasHintStillDereferences) {
+    const auto pkg = aliased_jdk_();
+    EXPECT_EQ(xlings::xim::detail_::select_version_(pkg, "linux", "25.0.4"),
+              "25.0.4+7");
+}
+
+TEST(XimSelectVersionAlias, NoHintWithoutLatestPicksAConcreteKey) {
+    mcpplibs::xpkg::Package pkg;
+    pkg.name = "android-platform";
+    pkg.spec = "1";
+    mcpplibs::xpkg::PlatformResource real;
+    real.url = "https://example.com/platform-35_r2.zip";
+    mcpplibs::xpkg::PlatformResource alias;
+    alias.ref = "35-r2";
+    pkg.xpm.entries["linux"]["35-r2"] = real;
+    pkg.xpm.entries["linux"]["35"] = alias;
+    EXPECT_EQ(xlings::xim::detail_::select_version_(pkg, "linux", ""),
+              "35-r2");
+}
+
+TEST(XimSelectVersionAlias, AnAliasToAMissingKeyStillNamesItsTarget) {
+    mcpplibs::xpkg::Package pkg;
+    pkg.name = "x";
+    pkg.spec = "1";
+    mcpplibs::xpkg::PlatformResource alias;
+    alias.ref = "2.0.0";
+    pkg.xpm.entries["linux"]["2"] = alias;
+    // The alias is the only entry; its target is what a store directory would
+    // be called, so that is the answer -- never the alias string.
+    EXPECT_EQ(xlings::xim::detail_::select_version_(pkg, "linux", ">=1"),
+              "2.0.0");
+}
+
+// 2026.9.12 F6: concrete_versions_ used to follow exactly ONE ref hop, so a
+// CHAIN of aliases ("8" -> "8.0" -> "8.0.1", the real, concrete key) left
+// ">=8" resolving to "8.0" -- itself just another name, never a directory
+// the store created. Fixed to follow the chain to its end.
+TEST(XimSelectVersionAlias, ChainedAliasResolvesToItsConcreteEnd) {
+    mcpplibs::xpkg::Package pkg;
+    pkg.name = "openjdk-chain";
+    pkg.spec = "1";
+    mcpplibs::xpkg::PlatformResource real;
+    real.url = "https://example.com/jdk-8.0.1.tar.gz";
+    mcpplibs::xpkg::PlatformResource middleAlias;
+    middleAlias.ref = "8.0.1";
+    mcpplibs::xpkg::PlatformResource headAlias;
+    headAlias.ref = "8.0";
+    pkg.xpm.entries["linux"]["8.0.1"] = real;
+    pkg.xpm.entries["linux"]["8.0"] = middleAlias;
+    pkg.xpm.entries["linux"]["8"] = headAlias;
+
+    // A range hint that only "8"'s chain can satisfy: >=8 must land on the
+    // real, concrete "8.0.1" -- not on "8.0", the middle link, which is
+    // itself just another alias and was never installed on its own.
+    //
+    // (Exact-match hints ("8", "8.0") go through select_version_'s OWN
+    // direct-lookup branch, a separate one-hop dereference this finding
+    // does not touch -- concrete_versions_ backs the range/prefix branch
+    // only, which is what this asserts.)
+    EXPECT_EQ(xlings::xim::detail_::select_version_(pkg, "linux", ">=8"),
+              "8.0.1");
 }

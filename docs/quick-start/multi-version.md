@@ -148,6 +148,42 @@ graph TD
     B1 -.->|版本视图| P2
 ```
 
+### 本地包索引（`--add-xpkg`）
+
+`xlings config --add-xpkg <file>` 把一个包描述文件（`xpkg.lua`）复制进本地
+索引（overlay），之后就可以像官方索引里的包一样 `install`/`use` 它：
+
+```bash
+xlings config --add-xpkg ./mypkg.lua
+xlings install mypkg@1.0.0
+```
+
+本地 overlay 会积累——尤其是在同一个包后来被官方索引收录之后，本地那份
+就成了纯粹的重复。三个命令用来查看和清理它：
+
+```bash
+xlings config --list-xpkg              # 列出本地 overlay 里的每个包
+xlings config --remove-xpkg <NAME>     # 删除某一个本地包
+xlings config --clear-xpkg all         # 清空整个 overlay
+xlings config --clear-xpkg stale       # 只删掉"已经被索引追平"的那部分
+```
+
+`--list-xpkg` 的 `status` 列说明了每条记录和当前已同步索引的关系：
+
+| status | 含义 |
+|---|---|
+| `unique` | 索引里没有同名包，这是唯一来源 |
+| `identical` | 索引里已经有一份字节完全相同的同名包——可以安全清理 |
+| `modified` | 索引里有同名包，但内容不同（不只是版本号更新） |
+| `behind` | 索引里的同名包声明了更新的版本 |
+
+`--clear-xpkg stale` 删除的就是 `identical` 和 `behind` 这两类。
+
+**`xlings update` 也会做这件事，不用你记得手动清理**：每次同步索引之后，
+`update` 会自动扫描本地 overlay，把其中与刚同步的索引"字节完全相同"的
+副本删掉，并打印删掉了哪些包。手动 `--remove-xpkg` / `--clear-xpkg` 只在
+你想立刻清理、或者想删掉一个 `modified`/`unique` 记录时才需要。
+
 ## 与 SubOS 的交互
 
 每个 SubOS 拥有独立的 workspace 配置文件（`.xlings.json`），记录该环境的活跃版本。这意味着：
@@ -177,6 +213,20 @@ gcc --version   # 16.1.0
 
 # 两个环境互不干扰，物理存储共享
 xlings list
+```
+
+## 跨 SubOS 卸载
+
+`xlings remove <package>` 默认只影响当前 SubOS 的活跃版本。三个 flag 把
+它的作用范围扩大：
+
+- `--all` — 卸载这个包的**每一个**已安装版本，而不只是当前活跃的那个
+- `--all-subos` — 从**每一个装了它的 SubOS**里卸载，而不只是当前这个
+- `--subos <NAME>` — 只作用于指定的那个 SubOS，而不是当前 SubOS
+
+```bash
+xlings remove gcc --all-subos      # 所有 SubOS 里的 gcc 都卸载掉
+xlings remove gcc --subos probe    # 只卸载 probe 这个 SubOS 里的 gcc
 ```
 
 ## 注意事项

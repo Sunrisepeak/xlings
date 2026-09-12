@@ -390,3 +390,21 @@ TEST(SemverGeneralized, MixedFieldsKeepFieldCountSemantics) {
     EXPECT_TRUE(satisfies_expr("6.5.1", "6.5"));
     EXPECT_FALSE(satisfies_expr("6.6", "6.5"));
 }
+
+// #590 — build metadata is not precedence, and a key carrying it is still a
+// version. Temurin publishes `25.0.4+7` as its real key and `25.0.4` as an
+// alias; a range must be able to see the real one.
+TEST(SemverParse, BuildMetadataIsIgnored) {
+    auto v = parse("25.0.4+7");
+    ASSERT_TRUE(v.has_value());
+    EXPECT_EQ(v->raw, "25.0.4+7");
+    EXPECT_TRUE(satisfies_expr("25.0.4+7", ">=11"));
+    EXPECT_TRUE(satisfies_expr("25.0.4+7", "^25"));
+    EXPECT_EQ(compare("25.0.4+7", "25.0.4"), 0);
+    EXPECT_FALSE(parse("+7").has_value());
+}
+
+TEST(SemverSelectBest, PrefersTheConcreteKeyOverNothing) {
+    const std::vector<std::string> available = {"25.0.4+7", "17.0.2+8"};
+    EXPECT_EQ(select_best(available, ">=11"), "25.0.4+7");
+}

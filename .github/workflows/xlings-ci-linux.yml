@@ -391,3 +391,195 @@ jobs:
         with:
           name: xlings-linux-x86_64
           path: build/release.tar.gz
+
+  unit-asan:
+    # Sanitizer profile for the unit suite (mcpp.toml `[profile.asan]`,
+    # issue #433: a use-after-free reached three releases undetected because
+    # nothing ever ran the tests instrumented). Measured locally 2026-09-12:
+    # `mcpp test --profile asan` is 54/54 green, build ~18 min -- so this is
+    # a HARD gate (no continue-on-error), not a diagnostic-only job.
+    #
+    # Steps mirror build-and-test's bootstrap/toolchain/cache/index sequence
+    # exactly, up to "Build and run unit tests" -- see that job for the
+    # reasoning behind each one (BMI wipe, registry prune, index refresh
+    # retry). The one thing that MUST differ is the mcpp cache key: BMIs are
+    # compiled with `-fsanitize=address,undefined` and are not interchangeable
+    # with the dev profile's BMI set (same "CRC mismatch" failure mode
+    # documented on that cache step) -- so this job's key carries a distinct
+    # "-asan-" segment that appears nowhere in build-and-test's key or
+    # restore-keys, and vice versa, so an inexact restore can never hand one
+    # profile's BMIs to the other.
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y curl git build-essential
+
+      - name: Install bootstrap xlings (pinned ${{ env.BOOTSTRAP_XLINGS_VERSION }})
+        env:
+          XLINGS_NON_INTERACTIVE: 1
+          XLINGS_VERSION: ${{ env.BOOTSTRAP_XLINGS_VERSION }}
+        run: |
+          for attempt in 1 2 3; do
+            curl -fsSL --retry 3 --retry-delay 5 --connect-timeout 20 \
+              https://raw.githubusercontent.com/openxlings/xlings/main/tools/other/quick_install.sh \
+              -o /tmp/xlings-quick-install.sh && break
+            echo "bootstrap download failed (attempt $attempt/3); retrying"
+            sleep 10
+          done
+          test -s /tmp/xlings-quick-install.sh \
+            || { echo "::error::could not download quick_install.sh"; exit 1; }
+          bash /tmp/xlings-quick-install.sh
+          test -x "$HOME/.xlings/bin/xlings" \
+            || { echo "::error::bootstrap reported success but installed no xlings"; exit 1; }
+          echo "XLINGS_HOME=$HOME/.xlings"           >> "$GITHUB_ENV"
+          echo "$HOME/.xlings/subos/current/bin"     >> "$GITHUB_PATH"
+          echo "$HOME/.xlings/bin"                   >> "$GITHUB_PATH"
+
+      - name: Cache xlings package payloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.xlings/data/xpkgs
+          key: xlings-deps-${{ runner.os }}-${{ hashFiles('.xlings.json') }}-${{ env.BOOTSTRAP_XLINGS_VERSION }}
+          restore-keys: |
+            xlings-deps-${{ runner.os }}-
+
+      - name: Cache mcpp sandbox and project packages (asan profile)
+        id: mcpp-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.mcpp
+            !~/.mcpp/bmi
+            !~/.mcpp/build-cache
+            .mcpp
+            !.mcpp/bmi
+            !.mcpp/build-cache
+          # "-asan-" is the whole point of this key: it cannot collide, by
+          # prefix or by restore-keys fallback, with build-and-test's
+          # "mcpp-v4-ci-linux-${{ runner.os }}-..." key. See the job comment.
+          key: mcpp-v4-ci-linux-asan-${{ runner.os }}-${{ hashFiles('mcpp.toml', 'mcpp.lock', '.xlings.json') }}-${{ env.BOOTSTRAP_XLINGS_VERSION }}
+          restore-keys: |
+            mcpp-v4-ci-linux-asan-${{ runner.os }}-
+
+      # Verbatim from build-and-test's identically-named step -- the job
+      # comment above claims to mirror that job's sequence exactly, and a
+      # cache-class failure (an inexact restore mixing BMI sets) needs the
+      # same visibility here as it does there. `steps.mcpp-cache` resolves
+      # to THIS job's own cache step (same id, different job -- no
+      # collision), so no path/key literal needs to change.
+      - name: Record the restored BMI set (diagnostic for #56)
+        shell: bash
+        continue-on-error: true
+        run: |
+          echo "cache-hit: ${{ steps.mcpp-cache.outputs.cache-hit }}"
+          for d in ~/.mcpp/bmi .mcpp/bmi ~/.mcpp/build-cache .mcpp/build-cache; do
+            if [ -d "$d" ]; then
+              echo "  $d: $(du -sh "$d" 2>/dev/null | cut -f1), $(find "$d" -name '*.gcm' 2>/dev/null | wc -l) .gcm"
+            else
+              echo "  $d: absent"
+            fi
+          done
+          echo "  --- build identity per BMI dir (first 40) ---"
+          find ~/.mcpp/bmi .mcpp/bmi -name std-module.json 2>/dev/null | head -40 |
+          while read -r f; do
+            printf '  %-18s %s %s\n' \
+              "$(basename "$(dirname "$f")")" \
+              "$(grep -o '"cpp_standard": *"[^"]*"' "$f" | cut -d'"' -f4)" \
+              "$(grep -o '"driver_identity": *"[^"]*"' "$f" | cut -d'"' -f4)"
+          done
+          echo "  --- distinct driver identities ---"
+          find ~/.mcpp/bmi .mcpp/bmi -name std-module.json 2>/dev/null |
+            xargs -r grep -ho '"driver_identity": *"[^"]*"' | sort -u
+
+      - name: Drop restored BMIs
+        if: env.XLINGS_KEEP_RESTORED_BMIS != '1'
+        shell: bash
+        run: |
+          rm -rf ~/.mcpp/bmi ~/.mcpp/build-cache .mcpp/bmi .mcpp/build-cache
+
+      - name: Prepare bootstrap package index
+        run: |
+          rm -rf "$XLINGS_HOME/data/xim-pkgindex"
+          bash tests/e2e/prepare_fixture_index.sh "$XLINGS_HOME/data/xim-pkgindex"
+
+      - name: Install build dependencies (mcpp)
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          xlings config --mirror GLOBAL
+          xlings update || true
+          xlings install -y
+          pin="$(python3 -c 'import json;print(json.load(open(".xlings.json"))["workspace"]["mcpp"])' 2>/dev/null || true)"
+          [ -n "$pin" ] && xlings use mcpp "$pin" || true
+          mcpp self version
+
+      - name: Reinitialize mcpp registry (GLOBAL)
+        run: |
+          prune_registry() {
+            [ -d "$1" ] || return 0
+            find "$1" -mindepth 1 -maxdepth 1 ! -name data -exec rm -rf {} +
+            [ -d "$1/data" ] || return 0
+            find "$1/data" -mindepth 1 -maxdepth 1 ! -name xpkgs -exec rm -rf {} +
+          }
+          prune_registry "$HOME/.mcpp/registry"
+          prune_registry "$GITHUB_WORKSPACE/.mcpp/registry"
+          mcpp self config --mirror GLOBAL
+          mcpp index update || true
+          mcpp index status || true
+
+      - name: Prepare unit fixture index repo
+        run: |
+          bash tests/e2e/prepare_fixture_index.sh ../xim-pkgindex
+
+      - name: Build and run unit tests (asan profile)
+        run: |
+          # No continue-on-error: measured green (54/54) locally before this
+          # job was added, so a red run here is a real regression, not noise
+          # to route around.
+          mcpp build --profile asan || {
+            echo "::warning::mcpp build --profile asan failed (likely stale index entry); retrying after auto-refresh"
+            mcpp build --profile asan
+          }
+          mcpp test --profile asan
+
+      # Verbatim from build-and-test's identically-named step. Same generic
+      # $HOME/.mcpp and $GITHUB_WORKSPACE/.mcpp paths as that job -- neither
+      # job's diagnostic references its cache key literal, only the
+      # runner-local registry directories, so nothing here needs to change
+      # for the asan profile.
+      - name: Diagnose a failed mcpp build
+        if: failure()
+        run: |
+          for idx in "$HOME/.mcpp/registry/data/mcpplibs/pkgs/x/xpkg.lua" \
+                     "$GITHUB_WORKSPACE/.mcpp/registry/data/mcpplibs/pkgs/x/xpkg.lua"; do
+            if [ -f "$idx" ]; then
+              echo "--- $idx"
+              grep -oE '\["[0-9]+\.[0-9]+\.[0-9]+"\]' "$idx" | head -8
+            else
+              echo "--- $idx : ABSENT"
+            fi
+          done
+          for root in "$HOME/.mcpp/registry" "$GITHUB_WORKSPACE/.mcpp/registry"; do
+            [ -d "$root" ] || continue
+            echo "--- $root"
+            ls -1 "$root" 2>/dev/null | head -8
+            ls -1 "$root/data" 2>/dev/null | head -8
+            ls -1 "$root/index-snapshots" 2>/dev/null | head -8
+          done
+          mcpp --version 2>&1 | head -2 || true
+          mcpp self version 2>&1 | head -3 || true
+          xlings --version 2>&1 | head -2 || true
+
+      - name: Sanitizer verdict
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "### unit-asan: PASS (mcpp test --profile asan)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### unit-asan: FAIL (mcpp test --profile asan)" >> "$GITHUB_STEP_SUMMARY"
+          fi

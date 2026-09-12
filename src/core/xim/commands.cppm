@@ -92,8 +92,16 @@ std::optional<std::string> index_runtime_abi_of(
 std::string detect_platform();
 
 // Forward declaration for deferred install request processing
+//
+// all: remove every version the version DB has for this target instead of
+// just the resolved one (`--all`).
+// subosScope: nullopt when neither `--subos` nor `--all-subos` was passed
+// (act on the current subos, per the usual membership rules); "*" for
+// `--all-subos` (every subos that references the target); any other value
+// names one subos directly (`--subos <name>`).
 int cmd_remove(const std::string& target, bool yes, EventStream& stream,
-               bool force = false);
+               bool force = false, bool all = false,
+               std::optional<std::string> subosScope = std::nullopt);
 
 // Debounce on-demand index refreshes triggered by install misses (C2 / #366
 // UX): returns true at most once per cooldown window so a tight loop of
@@ -133,14 +141,88 @@ int cmd_install(std::span<const std::string> targets, bool yes, bool noDeps,
 // (pkgmanager.remove inside an xpkg) always pass yes=true: the user already
 // approved the parent install, so the connected uninstall is implicit.
 // CLI-driven `xlings remove <pkg>` defaults to yes=false and bails on n.
+//
+// force: "no matter what, make it gone" -- also tolerates the recipe's
+// uninstall() hook throwing and the recipe not resolving through any index
+// at all. State is withdrawn either way; force only decides whether that is
+// reported as success.
+//
+// all: instead of resolving to one version (the active one, or the lone
+// version registered), remove every version this target has in the version
+// DB, highest first.
+//
+// subosScope: nullopt acts on the current subos (escalating to every subos
+// that references the target only when the target is absent here, present
+// elsewhere, and `yes` was given -- see the membership guard's "remove it
+// everywhere" action for the manual equivalent). "*" (`--all-subos`) acts on
+// every subos that references the target. Any other value (`--subos NAME`)
+// acts on exactly that one subos, whether or not it currently has the
+// target.
+// One package that would still need `targetBare`, by name and version.
+struct Dependent { std::string name; std::string version; };
+
+// Direct dependents of `targetBare` (a BARE package name -- no namespace,
+// no version) among everything currently installed in the CURRENT subos.
+//
+// Shared by two callers that ask the identical question for opposite
+// reasons. `cmd_remove`'s own reverse-dependency guard asks it BEFORE
+// removing anything, to refuse and name them. The repair ladder's R3
+// (`self doctor --fix`, src/core/xself/repair.cpp) runs `remove --force`
+// -- deliberately bypassing that guard, the same way a human's `--force`
+// does -- and when the reinstall that was meant to follow then fails, the
+// package is gone for real and whatever named it as a dependency is now
+// broken with no diagnostic pointing back at this repair. Asking the same
+// question AFTER the fact, in that one outcome, is what lets the report
+// say so instead of leaving the next `ld.lld` failure to look unrelated.
+//
+// Only DIRECT dependents, and that is not a shortcut: a dependency's
+// libdirs enter a payload's RPATH closure only when it is named as a
+// direct dep (elfpatch's closure_lib_paths reads the direct list). A
+// package two hops away does not have this payload on any search path, so
+// removing it cannot break that package through the loader.
+std::vector<Dependent> direct_dependents_of(PackageCatalog& catalog,
+                                            std::string_view targetBare);
+
 std::expected<bool, std::string>
 selected_payloadless_config_has_uninstall_(
         PackageCatalog& catalog,
         const PackageMatch& match,
         std::string_view platform);
 
+// RAII guard for acting on a named subos for a scoped stretch of code, then
+// restoring both halves of "which subos is current": the XLINGS_ACTIVE_SUBOS
+// env var (what a spawned or re-entered activation path re-reads) and
+// Config's active-subos override (what Config's own cached paths/workspace
+// are derived from).
+//
+// `name.empty()` is a no-op guard -- "stay on the current subos", the common
+// case -- so a caller never needs its own branch for "did I actually switch".
+//
+// Exit restores in the SAME relative order as entry (env var, override, one
+// reload), not the reverse: `Config::set_active_subos_override("")` falls
+// through to reading XLINGS_ACTIVE_SUBOS whenever the restored override is
+// empty, so the env var has to already be back to its previous value BEFORE
+// the override is restored -- restoring the override first would resolve
+// against the env var this guard just switched, landing on the subos being
+// LEFT rather than the one being returned to. The extra explicit
+// `Config::reload_state()` on each end compensates for
+// `set_active_subos_override`'s own reload reading `paths_.activeSubos`
+// before recomputing it, which would otherwise use the state from one
+// transition ago.
+struct ScopedSubosOverride {
+    explicit ScopedSubosOverride(std::string name);
+    ~ScopedSubosOverride();
+    ScopedSubosOverride(const ScopedSubosOverride&) = delete;
+    ScopedSubosOverride& operator=(const ScopedSubosOverride&) = delete;
+
+private:
+    bool active_;
+    std::string prevEnv_;
+    std::string prevOverride_;
+};
+
 int cmd_remove(const std::string& target, bool yes, EventStream& stream,
-               bool force);
+               bool force, bool all, std::optional<std::string> subosScope);
 
 // === search command ===
 int cmd_search(const std::string& keyword, EventStream& stream);
@@ -164,6 +246,19 @@ int cmd_info(const std::string& target, EventStream& stream,
 
 // === add-xpkg command ===
 int cmd_add_xpkg(const std::string& fileOrUrl, EventStream& stream);
+
+// === local overlay: list / remove / clear ===
+//
+// The overlay `--add-xpkg` writes into has no attribution and no way to
+// clean it up. These three verbs are that: `--list-xpkg` shows what is
+// there and its relationship to the synced index (see
+// xlings.core.xim.overlay::Status), `--remove-xpkg` deletes one entry,
+// `--clear-xpkg` deletes a whole category ("all" or "stale" — Identical
+// plus Behind, the ones the synced index has already caught up with or
+// moved past).
+int cmd_list_xpkg();
+int cmd_remove_xpkg(const std::string& name);
+int cmd_clear_xpkg(const std::string& what);
 
 // === update command ===
 //

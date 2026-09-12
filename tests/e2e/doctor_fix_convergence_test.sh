@@ -359,4 +359,54 @@ RUN self doctor >/dev/null 2>&1 \
   || fail "S7: doctor still fails after --fix cleared the finding"
 log "  ✓ doctor is clean afterwards"
 
+# ── S8: an unclaimed release is pruned, not reinstalled, and convergence
+#        still holds (D2, 2026.9.12.1) ──────────────────────────────────
+#
+# alpha@9.9.9 is added to the DB by hand: the index CAN still resolve it
+# (added to the fixture's xpm table below) so the ladder WOULD find an
+# owner, but no workspace anywhere names 9.9.9 and its payload was never
+# created. Before D2 the ladder reinstalls whatever it can resolve; D2
+# prunes an unclaimed entry instead, because nothing will ever use it
+# again -- the same command the ladder would have run
+# (`xlings install alpha@9.9.9`) is what the dropped-registration note says
+# brings it back if that ever changes.
+log "S8: an unclaimed release is pruned, not reinstalled, and stays converged"
+emit_pkg alpha '["1.0.0"] = {}, ["2.0.0"] = {}, ["9.9.9"] = {}' alpha-only
+python3 - "$HOME_DIR" <<'PY'
+import json, pathlib, sys
+home = pathlib.Path(sys.argv[1])
+state = home / ".xlings.json"
+d = json.loads(state.read_text())
+d["versions"]["alpha"]["versions"]["9.9.9"] = {
+    "kind": "program",
+    "path": str(home / "data" / "xpkgs" / "xim-x-alpha" / "9.9.9" / "bin"),
+}
+state.write_text(json.dumps(d, indent=2))
+PY
+ALPHA9_PAYLOAD="$HOME_DIR/data/xpkgs/xim-x-alpha/9.9.9"
+
+out8dry=$(RUN self doctor --fix --dry-run 2>&1) || true
+echo "$out8dry" | grep -q "prune alpha@9\.9\.9" \
+  || fail "S8: the plan must prune the unclaimed alpha@9.9.9; got:\n$out8dry"
+echo "$out8dry" | grep -qE "would run .*install alpha@9\.9\.9" \
+  && fail "S8: an unclaimed entry must not be queued for reinstall; got:\n$out8dry"
+
+n8_before="$(issue_count)"
+RUN self doctor --fix >/dev/null 2>&1 || true
+n8_after1="$(issue_count)"
+RUN self doctor --fix >/dev/null 2>&1 || true
+n8_after2="$(issue_count)"
+
+[[ ! -d "$ALPHA9_PAYLOAD" ]] \
+  || fail "S8: --fix downloaded/reinstalled an unreferenced version instead of pruning it"
+[[ "$n8_after1" -le "$n8_before" ]] \
+  || fail "S8: pruning the unclaimed entry made the home worse ($n8_before -> $n8_after1)"
+[[ "$n8_after2" -le "$n8_after1" ]] \
+  || fail "S8: a second --fix regressed after the prune ($n8_after1 -> $n8_after2)"
+
+out8=$(RUN self doctor 2>&1) || true
+echo "$out8" | grep -q "alpha@9\.9\.9" \
+  && fail "S8: alpha@9.9.9 should be gone from the report after the prune; got:\n$out8"
+log "  ✓ unclaimed alpha@9.9.9 was pruned, never reinstalled, and the home stayed converged"
+
 log "all scenarios passed"

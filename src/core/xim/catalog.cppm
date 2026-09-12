@@ -5,6 +5,7 @@ import mcpplibs.xpkg;
 
 import xlings.core.config;
 import xlings.core.log;
+import xlings.core.notice;
 import xlings.core.xim.payload;
 import xlings.core.xim.index;
 import xlings.core.xim.repo;
@@ -23,6 +24,18 @@ struct RepoIndexSpec {
     PackageScope scope { PackageScope::Global };
     std::string defaultNamespace;
     bool subIndex { false };  // sub-index repos: lower priority for bare-name resolution
+};
+
+// A candidate that lost the bare-name namespace-priority tiebreak.
+//
+// `version` is carried separately from `coordinate` (rather than parsed back
+// out of it) so a caller can ask "did this candidate lose only because it is
+// the same build the index already has" without re-splitting a string on
+// `@`. Two `local:` copies of the identical version are not a conflict worth
+// a word; a `local:` copy BEHIND the index is.
+struct DemotedCandidate {
+    std::string coordinate;  // "local:xlings@0.4.51" -- no `@` when there is no version
+    std::string version;     // "0.4.51", bare
 };
 
 struct PackageMatch {
@@ -53,7 +66,7 @@ struct PackageMatch {
     // assert the choice was made AND announced -- a demotion the user cannot
     // see is a silent pick, which is the shape this rule was added to remove,
     // not to introduce.
-    std::vector<std::string> demoted;
+    std::vector<DemotedCandidate> demoted;
 };
 
 // #374: a single index repo that could not be loaded during rebuild
@@ -160,7 +173,7 @@ int namespace_rank_(std::string_view namespaceName);
 
 struct NamespaceRankResult_ {
     std::vector<PackageMatch> kept;
-    std::vector<std::string> demoted;   // "local:xlings@0.4.51"
+    std::vector<DemotedCandidate> demoted;
 };
 
 // BY CONST REFERENCE, and it copies what it keeps.
@@ -176,6 +189,36 @@ NamespaceRankResult_ prefer_namespace_rank_(
 
 std::vector<PackageMatch> prefer_project_scope_(
     std::vector<PackageMatch> matches);
+
+// Whether a namespace-priority demotion is worth a word, computed ONCE and
+// shared by both `PackageCatalog::announce_demotion_`'s in-process gate and
+// `demotion_notice`'s persisted one -- before this they each rebuilt
+// `losers` and the "every loser is a duplicate of the chosen version" check
+// independently, the same verdict derived twice by two copies of the same
+// three lines.
+//
+// nullopt when there is nothing to report: no candidates lost the tiebreak,
+// or every one that did is the identical version already chosen (the
+// ordinary shape of a dev machine with a `local:` copy next to the index's
+// own build, not a conflict).
+struct DemotionVerdict {
+    std::string fingerprint;  // target + "\x1f" + canonicalName + "\x1f" + losers
+    std::string losers;       // comma-joined `coordinate`s, for the message
+};
+
+std::optional<DemotionVerdict> demotion_verdict(const std::string& target,
+                                                const PackageMatch& chosen);
+
+// The decision behind `PackageCatalog::announce_demotion_`, and the only
+// part of it worth unit-testing: whether a demotion is worth a word (via
+// `demotion_verdict`) and whether this Memo has already said so. Free
+// function with an injected `notice::Memo` rather than a `PackageCatalog`
+// member, so a test can drive it without a home or a loaded catalog -- see
+// test_xim_catalog.cpp.
+//
+// Returns true when it emitted.
+bool demotion_notice(const std::string& target, const PackageMatch& chosen,
+                     const notice::Memo& memo);
 
 }  // namespace detail_
 

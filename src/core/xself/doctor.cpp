@@ -16,6 +16,7 @@ import xlings.core.glyph;
 import xlings.libs.json;
 import xlings.core.log;
 import xlings.platform;
+import xlings.core.utils;
 import xlings.runtime;
 import xlings.core.elf_same_source;
 import xlings.core.entry_binary;
@@ -36,6 +37,7 @@ import xlings.core.xself.repair;
 import xlings.core.xim.catalog;
 import xlings.core.xim.payload;
 import xlings.core.xim.install_state;
+import xlings.core.xim.commands;
 import xlings.core.profile;
 import xlings.core.subos.manifest;
 import xlings.platform.target;
@@ -93,7 +95,7 @@ DoctorState load_state_() {
     // itself as a foreigner.
     std::error_code cec;
     const auto here = fs::weakly_canonical(p.subosDir, cec);
-    for (auto& snapshot : profile::load_subos_snapshots(p.homeDir)) {
+    for (auto& snapshot : profile::load_subos_snapshots(p.homeDir, &st.unreadableSubos)) {
         std::error_code sec;
         if (fs::weakly_canonical(snapshot.dir, sec) == here) continue;
         st.otherSubos.push_back(xvm::SubosRef{
@@ -849,6 +851,7 @@ Scan detect_(const DoctorState& st, const CoordinateProbe& probe,
              const AuditSelection& audit) {
     auto& p = Config::paths();
     Scan scan;
+    scan.probeAvailable = audit.probeAvailable;
     const auto add = [&](Finding f) { scan.findings.push_back(std::move(f)); };
 
     // FIRST, because it explains the rest.
@@ -1367,21 +1370,47 @@ Scan detect_(const DoctorState& st, const CoordinateProbe& probe,
             return;
         }
         const auto wit = st.ws.find(name);
+        const bool activeHere = wit != st.ws.end() && wit->second == version;
+        // Computed unconditionally now, not only under `--deep`/`--fix`. A
+        // plain `self doctor` used to print "no package in any index
+        // provides this entry" for releases the index plainly does provide
+        // -- measured on a real home: 100 entries (fd@10.4.2, go@1.26.2, …)
+        // -- because this call was gated on the same flag that gates the
+        // expensive payload walk. The catalog lookup itself is cheap; only
+        // the walk was ever the cost. `probe` already answers `false`
+        // uniformly when cmd_doctor built no catalog at all, which is why
+        // this needs no gate of its own -- see Scan::probeAvailable for how
+        // the render layer tells that case apart from a real "no".
         std::string remedy;
-        if (audit.deep) {
-            if (auto coord = owning_coordinate_(st.db, name, version, probe)) {
-                remedy = coord->install_command();
-            }
+        if (auto coord = owning_coordinate_(st.db, name, version, probe)) {
+            remedy = coord->install_command();
         }
         add({
-            .kind     = FindingKind::BrokenPayload,
-            .level    = FindingLevel::Error,
-            .target   = name,
-            .version  = version,
-            .detail   = std::move(detail),
-            .remedy   = std::move(remedy),
-            .groupKey = std::format("{}|{}", expanded.string(), version),
-            .active   = wit != st.ws.end() && wit->second == version,
+            .kind      = FindingKind::BrokenPayload,
+            .level     = FindingLevel::Error,
+            .target    = name,
+            .version   = version,
+            .detail    = std::move(detail),
+            .remedy    = std::move(remedy),
+            .groupKey  = std::format("{}|{}", expanded.string(), version),
+            .active    = activeHere,
+            // `owner.ownedHere` is `subos_claims`'s OR of "active here" and
+            // "in installed[] here" -- its first branch IS `activeHere`
+            // verbatim, so `!owner.ownedHere` already implies `!activeHere`.
+            // No separate term needed.
+            //
+            // `st.unreadableSubos` non-empty means the ownership walk above
+            // could not see every subos that might reference this (target,
+            // version) -- the same controller ruling installer.cpp's
+            // `is_version_referenced_anywhere_` already applies to `remove`
+            // and the installer refresh: a subos this scan could not open is
+            // "might still reference it", never "does not". Calling this
+            // finding `unclaimed` here would route it to D2's prune, which
+            // drops the registration outright -- over-pruning something a
+            // corrupted sibling subos still uses is the one mistake this
+            // repair cannot walk back, unlike re-detecting and trying again.
+            .unclaimed = !owner.ownedHere && owner.otherSubos.empty()
+                       && st.unreadableSubos.empty(),
         });
     };
 
@@ -2385,14 +2414,43 @@ Scan detect_(const DoctorState& st, const CoordinateProbe& probe,
         }
     }
 
-    for (const auto& f : xvm::inspect_subos_references(st.db, st.otherSubos)) {
+    // Per OTHER subos, not one call over all of them: `inspect_subos_references`
+    // reports which entry is wrong but not whose workspace it read it from,
+    // and the cross-subos `--fix` walk (below, in cmd_doctor) needs a real
+    // subos name per finding to know which subprocess to run. Calling it once
+    // per `other` costs nothing extra -- each call already only looks at that
+    // one SubosRef -- and gives every resulting Finding a `.subos` that
+    // matches the one already embedded in `f.summary`/`f.hint`'s prose.
+    for (const auto& other : st.otherSubos) {
+        for (const auto& f : xvm::inspect_subos_references(st.db, {other})) {
+            add({
+                .kind    = FindingKind::OtherSubos,
+                .level   = f.severity == xvm::BindingSeverity::Notice
+                               ? FindingLevel::Notice : FindingLevel::Warning,
+                .target  = f.target,
+                .version = f.version,
+                .detail  = std::format("{} — {} — {}", f.summary, f.code, f.hint),
+                .subos   = {other.subos},
+            });
+        }
+    }
+
+    // One broken package must not break the others: an unparsable
+    // subos/<name>/.xlings.json used to be a silent `catch (...) {}` in
+    // load_subos_snapshots(). Reported here instead, one Warning per name, so
+    // a hand-edit mistake shows up instead of quietly dropping that subos out
+    // of every cross-subos question.
+    for (const auto& name : st.unreadableSubos) {
         add({
-            .kind    = FindingKind::OtherSubos,
-            .level   = f.severity == xvm::BindingSeverity::Notice
-                           ? FindingLevel::Notice : FindingLevel::Warning,
-            .target  = f.target,
-            .version = f.version,
-            .detail  = std::format("{} — {} — {}", f.summary, f.code, f.hint),
+            .kind       = FindingKind::SubosUnreadable,
+            .level      = FindingLevel::Warning,
+            .target     = name,
+            .detail     = std::format("subos '{}' has an unreadable {}",
+                                       name,
+                                       Config::display_path(
+                                           p.homeDir / "subos" / name / ".xlings.json")),
+            .remedyNote = "fix the JSON by hand or `xlings subos remove "
+                          + name + "`",
         });
     }
 
@@ -3112,7 +3170,224 @@ void repair_other_subos_(const DoctorState& st, RepairReport& out) {
     }
 }
 
+// A ForeignPayload or OtherSubos finding names a real defect, but repairing
+// it means running `xlings install`/`use` against a DIFFERENT subos's
+// workspace -- which this process cannot do while it is anchored to the one
+// it started in (see the `--subos` override at the top of cmd_doctor).
+// Walking every such subos in its own subprocess is how a plain `--fix`
+// reaches them without first making the user run `xlings subos use <name>
+// && xlings self doctor --fix` by hand -- the remedy 38 findings carried on
+// a measured home.
+//
+// The caller is responsible for not calling this from a process already
+// anchored via `--subos`: a child invoked WITH --subos must not walk again,
+// or two subprocesses would race to repair each other's findings (and,
+// unguarded, never terminate).
+// How long a single `self doctor --fix --subos <name>` child may run before
+// this process gives up on it.
+//
+// Nothing bounded this before: `platform::exec`'s `std::system` waits for
+// the child to exit, however long that takes, and a child wedged on (say) a
+// network stall behind a broken mirror hung the PARENT right along with it
+// -- indistinguishable, from the parent's own output, from any other slow
+// repair. `XLINGS_LOCK_TIMEOUT` does not help here: that bounds waiting for
+// ANOTHER xlings's lock, not waiting for a child THIS process itself
+// started and is blocking on.
+//
+// Env override in seconds, `0` disables the bound entirely (waits forever,
+// the pre-existing behaviour) -- the same escape hatch shape
+// `XLINGS_LOCK_TIMEOUT` uses, for the same reason: a machine that legitimately
+// does long installs must be able to say so.
+constexpr std::string_view doctor_child_timeout_env_() {
+    return "XLINGS_DOCTOR_CHILD_TIMEOUT";
+}
+
+constexpr int default_doctor_child_timeout_seconds_() { return 1800; }  // 30 min
+
+int doctor_child_timeout_seconds_() {
+    const auto configured =
+        utils::get_env_or_default(std::string(doctor_child_timeout_env_()));
+    if (configured.empty()) return default_doctor_child_timeout_seconds_();
+    long long seconds = 0;
+    const auto* first = configured.data();
+    const auto* last = first + configured.size();
+    if (auto [ptr, ec] = std::from_chars(first, last, seconds);
+        ec == std::errc{} && ptr == last && seconds >= 0) {
+        return static_cast<int>(seconds);
+    }
+    return default_doctor_child_timeout_seconds_();
+}
+
+// Whether GNU-style `timeout(1)` is on PATH, checked once per process.
+//
+// The only portable bound `std::system` admits without this repo taking on
+// its own process-group/fork machinery. Absent (stock macOS ships none;
+// some minimal containers don't either), the child runs unbounded exactly
+// as it always did -- documented, not silently degraded: the caller says so
+// once, and a hung child there still eventually surfaces as a hung `--fix`,
+// which is the pre-existing, understood failure mode this is only removing
+// on platforms that can support removing it.
+bool have_timeout_tool_() {
+    static const bool have = [] {
+        return platform::run_command_capture(
+                   "command -v timeout >/dev/null 2>&1").first == 0;
+    }();
+    return have;
+}
+
+// GNU coreutils `timeout` exits 124 when it had to kill the child (or
+// 128+signal for a child that caught and was killed by the escalation
+// signal -- not reached here, no `--signal`/`-k` is passed). This is the
+// one exit code this wrapper adds to whatever the child could have exited
+// with on its own, so it is what tells "timed out" apart from "the repair
+// itself failed with some ordinary non-zero code".
+constexpr int timeout_tool_killed_rc_() { return 124; }
+
+void repair_other_subos_walk_(const Scan& scan, const std::string& client,
+                              bool dryRun, const CommandRunner& run,
+                              RepairReport& out,
+                              const std::function<void(std::string_view)>& onStep = {}) {
+    std::set<std::string> owners;
+    for (const auto& f : scan.findings) {
+        if ((f.kind == FindingKind::ForeignPayload
+             || f.kind == FindingKind::OtherSubos)
+            && !f.subos.empty()) {
+            owners.insert(f.subos.front());
+        }
+    }
+    for (const auto& name : owners) {
+        // Same guard every other shelled-out value in this file gets
+        // (client/target/version). A name that fails it is never executed
+        // -- reported as a failed subos instead, with a hand-run remedy, so
+        // it still gates the exit code and the stamp rather than silently
+        // dropping out of the walk. `is_shell_safe_token` refuses a leading
+        // '-' too, which is also exactly what would make the CHILD's own
+        // `--subos <value>` parser read the name as another flag and fail
+        // in some other, more confusing way -- one check covers both.
+        if (!is_shell_safe_token(name)) {
+            out.failedSubos.emplace_back(name, -1);
+            out.notes.emplace_back(
+                glyph::mark(glyph::failed, "cross-subos repair skipped"),
+                std::format(
+                    "subos '{}' — name is not a safe shell token; run "
+                    "`xlings subos use {} && xlings self doctor --fix` by "
+                    "hand", name, name));
+            continue;
+        }
+        const auto cmd = std::format(
+            "{} self doctor --fix --subos {}{}", client, name,
+            dryRun ? " --dry-run" : "");
+        if (dryRun) {
+            out.planned.push_back(std::format("would run {}", cmd));
+            continue;
+        }
+        if (onStep) onStep(std::format(
+            "repairing subos {} — running `{}`", name, cmd));
+
+        const int timeoutSeconds = doctor_child_timeout_seconds_();
+        const bool bounded = timeoutSeconds > 0 && have_timeout_tool_();
+        const auto boundedCmd = bounded
+            ? std::format("timeout {}s {}", timeoutSeconds, cmd)
+            : cmd;
+        if (timeoutSeconds > 0 && !bounded) {
+            // Said once per walk, not per subos: the same fact ("this
+            // platform cannot enforce the bound") is true for every child
+            // this loop is about to run.
+            static bool warnedOnce = false;
+            if (!warnedOnce) {
+                warnedOnce = true;
+                out.notes.emplace_back(
+                    glyph::mark(glyph::warn, "no child timeout"),
+                    std::format(
+                        "`timeout` is not on PATH; a cross-subos repair "
+                        "child can run unbounded on this machine (set {} "
+                        "and install coreutils' `timeout` to bound it)",
+                        doctor_child_timeout_env_()));
+            }
+        }
+        const int rc = run(boundedCmd + quiet_suffix());
+        if (bounded && rc == timeout_tool_killed_rc_()) {
+            // -2: distinct from every real exit code a child can produce on
+            // its own (0..127 from a normal exit, 128+signal from one it
+            // caught) and from the -1 the shell-safety guard above already
+            // uses for "never even run". A caller reading `failedSubos`
+            // needs a fourth bucket for "we do not know what state it left
+            // things in, because we killed it".
+            out.failedSubos.emplace_back(name, -2);
+            out.notes.emplace_back(
+                glyph::mark(glyph::failed, "cross-subos repair"),
+                std::format(
+                    "subos '{}' — `{}` timed out after {}s and was killed; "
+                    "run it directly (raise {} first if it is a slow, "
+                    "legitimate install)",
+                    name, cmd, timeoutSeconds, doctor_child_timeout_env_()));
+        } else if (rc != 0) {
+            out.failedSubos.emplace_back(name, rc);
+            out.notes.emplace_back(
+                glyph::mark(glyph::failed, "cross-subos repair"),
+                std::format("subos '{}' — `{}` exited {}; run it directly "
+                            "to see why", name, cmd, rc));
+        } else {
+            out.notes.emplace_back(
+                glyph::mark(glyph::bullet, "other subos repaired"),
+                std::format("subos '{}' repaired via `self doctor --fix "
+                            "--subos {}`", name, name));
+        }
+    }
+}
+
 // ── the payload ladder ───────────────────────────────────────────────
+
+// Drop one (target, version) registration: erase the versions-DB entry,
+// clear it out of the workspace and installed[] if it was named there, and
+// drop any binding edge that would otherwise outlive it and leave the
+// release it belonged to unresolvable.
+//
+// The caller owns the lock, the reload, and the save -- this is only the
+// per-victim body, shared by repair_payloads_'s unclaimed-but-owned prune
+// (D2, below) and by the dead-registration ladder rung further down, so
+// there is exactly one place that knows how to make a (target, version)
+// disappear from the DB. Returns whether anything was actually dropped
+// (false when the entry was already gone by the time this ran).
+bool prune_one_(xvm::VersionDB& db, xvm::Workspace& ws,
+                xvm::WorkspaceInstalled& installed,
+                const std::string& target, const std::string& version,
+                RepairReport& out, std::string_view reason) {
+    const auto infoIt = db.find(target);
+    if (infoIt == db.end()) return false;
+    if (infoIt->second.versions.erase(version) == 0) return false;
+    out.notes.emplace_back(glyph::mark(glyph::bullet, "dropped"), std::format(
+        "{} — {}", xvm::display_coordinate(target, version), reason));
+    out.prunedEntries.emplace_back(target, version);
+
+    if (const auto wit = ws.find(target);
+        wit != ws.end() && wit->second == version) {
+        ws.erase(wit);
+    }
+    if (const auto iit = installed.find(target); iit != installed.end()) {
+        std::erase(iit->second, version);
+        if (iit->second.empty()) installed.erase(iit);
+    }
+    for (auto& [_, info] : db) {
+        for (auto edgeIt = info.bindings.begin();
+             edgeIt != info.bindings.end();) {
+            if (edgeIt->first == target) {
+                std::erase_if(edgeIt->second, [&](const auto& edge) {
+                    return edge.second == version;
+                });
+            }
+            if (edgeIt->second.empty()) {
+                edgeIt = info.bindings.erase(edgeIt);
+            } else {
+                ++edgeIt;
+            }
+        }
+    }
+    if (infoIt->second.versions.empty()) {
+        db.erase(infoIt);
+    }
+    return true;
+}
 
 // `onStep`, because the repair below shells out to `xlings install` and that
 // can be a large download with nothing on screen.
@@ -3125,7 +3400,8 @@ void repair_other_subos_(const DoctorState& st, RepairReport& out) {
 void repair_payloads_(const DoctorState& st, const Scan& scan,
                       const CoordinateProbe& probe, bool dryRun,
                       RepairReport& out,
-                      const std::function<void(std::string_view)>& onStep = {}) {
+                      const std::function<void(std::string_view)>& onStep = {},
+                      xim::PackageCatalog* catalogForDependents = nullptr) {
     // Collapse the findings onto their owning package: one install per
     // release, not one per program in it. A broken llvm reports nine targets;
     // reinstalling llvm nine times would be nine downloads for one problem.
@@ -3141,12 +3417,59 @@ void repair_payloads_(const DoctorState& st, const Scan& scan,
         }
     }
 
+    // D2: an owner exists, but if EVERY finding it covers is unclaimed --
+    // no subos anywhere references this (target, version), not even the one
+    // running this repair -- reinstalling only recreates a payload nothing
+    // will use again. Measured on a real home: 65 of 107 broken payloads
+    // were old mcpp versions no subos referenced, and the index still
+    // provides mcpp for all of them, so the plain ladder would have
+    // re-downloaded every one. Pruning the registration is the correct
+    // repair here: the very command this loop would otherwise have run
+    // brings the entry straight back if anyone ever references it again.
+    //
+    // A group is only moved here when ALL its findings are unclaimed --
+    // a payload shared by a claimed and an unclaimed target (rare, but the
+    // grouping is by payload directory, not by target) still gets installed,
+    // because dropping it would take the claimed one down too.
+    std::map<xvm::InstallCoordinate, std::vector<const Finding*>> toInstall;
+    std::map<xvm::InstallCoordinate, std::vector<const Finding*>> toPrune;
+    for (auto& [coord, covered] : byOwner) {
+        const bool allUnclaimed = std::ranges::all_of(
+            covered, [](const Finding* f) { return f->unclaimed; });
+        (allUnclaimed ? toPrune : toInstall).emplace(coord, std::move(covered));
+    }
+
+    // `f->unclaimed` is never true while `st.unreadableSubos` is non-empty
+    // (see reportBrokenPayload's Check 3) -- a subos this scan could not
+    // open might be the one still referencing an entry that otherwise looks
+    // abandoned, so nothing above is routed to `toPrune` for that reason.
+    // Said here, once, rather than left for the reader to notice `toPrune`
+    // came back emptier than the findings suggested.
+    if (!st.unreadableSubos.empty() && !byOwner.empty()) {
+        out.notes.emplace_back(glyph::mark(glyph::bullet, "prune skipped"),
+            std::format(
+                "{} subos here could not be read, so an otherwise-"
+                "unreferenced entry is reinstalled instead of pruned here -- "
+                "it might still be the one that references it. Repair the "
+                "unreadable subos (see the finding above) and rerun to "
+                "prune anything that remains truly unused.",
+                st.unreadableSubos.size()));
+    }
+
     if (dryRun) {
-        for (const auto& [coord, covered] : byOwner) {
+        for (const auto& [coord, covered] : toInstall) {
             out.planned.push_back(std::format(
                 "{}   ({} entr{})", coord.install_command(), covered.size(),
                 covered.size() == 1 ? std::string("y")
                                     : std::string("ies")));
+        }
+        for (const auto& [coord, covered] : toPrune) {
+            for (const auto* f : covered) {
+                out.planned.push_back(std::format(
+                    "prune {} (unreferenced; `{}` brings it back)",
+                    xvm::display_coordinate(f->target, f->version),
+                    coord.install_command()));
+            }
         }
         for (const auto* f : unowned) {
             out.planned.push_back(std::format(
@@ -3154,6 +3477,41 @@ void repair_payloads_(const DoctorState& st, const Scan& scan,
                 xvm::display_coordinate(f->target, f->version)));
         }
         return;
+    }
+
+    if (!toPrune.empty()) {
+        auto lock = xvm::acquire_state_lock(Config::paths().homeDir);
+        if (!lock) {
+            out.notes.emplace_back(glyph::mark(glyph::failed, "prune"), std::format(
+                "cannot drop unreferenced registration(s): {}", lock.error()));
+            for (const auto& [coord, covered] : toPrune) {
+                for (const auto* f : covered) {
+                    out.failedEntries.emplace_back(f->target, f->version);
+                }
+            }
+        } else {
+            Config::reload_state();
+            auto& db = Config::versions_mut();
+            auto& ws = Config::workspace_mut();
+            auto& installed = Config::workspace_installed_mut();
+            std::size_t dropped = 0;
+            for (const auto& [coord, covered] : toPrune) {
+                const auto reason = std::format(
+                    "registration dropped — {} brings it back",
+                    coord.install_command());
+                for (const auto* f : covered) {
+                    if (prune_one_(db, ws, installed, f->target, f->version,
+                                   out, reason)) {
+                        ++dropped;
+                    }
+                }
+            }
+            if (dropped > 0) {
+                Config::save_versions();
+                Config::save_workspace();
+                out.pruned += static_cast<int>(dropped);
+            }
+        }
     }
 
     const CommandRunner run = [](const std::string& cmd) {
@@ -3170,7 +3528,7 @@ void repair_payloads_(const DoctorState& st, const Scan& scan,
         if (!self.empty() && is_shell_safe_token(self)) policy.client = self;
     }
 
-    for (const auto& [coord, covered] : byOwner) {
+    for (const auto& [coord, covered] : toInstall) {
         if (onStep) {
             onStep(std::format("repairing {} — running `{}` (this may download)",
                                coord.package, coord.install_command()));
@@ -3199,10 +3557,71 @@ void repair_payloads_(const DoctorState& st, const Scan& scan,
             .coordinate    = coord.canonical(),
             .reinstallable = true,   // confirmed by the probe above
         };
-        auto result = repair_one(task, policy, run, removalDone);
+        // Only consulted for R3's terminal outcome (see repair.cppm's
+        // DependentsProvider) -- cheap to pass unconditionally, since a
+        // healthy re-register or a successful reinstall never calls it.
+        DependentsProvider dependentsOf;
+        if (catalogForDependents) {
+            // xim::Dependent and xself::Dependent are two distinct types
+            // with the same two fields, not one type reused: repair.cppm
+            // documents why it keeps its own rather than importing xim's
+            // (no catalog access by design). std::function's target type
+            // is xself::Dependent, so the conversion is explicit here
+            // rather than relying on one aggregate silently standing in
+            // for the other.
+            dependentsOf = [&](const std::string& depTarget) {
+                auto xd = xim::direct_dependents_of(*catalogForDependents,
+                                                    depTarget);
+                std::vector<Dependent> out;
+                out.reserve(xd.size());
+                for (auto& d : xd) out.push_back({d.name, d.version});
+                return out;
+            };
+        }
+        auto result = repair_one(task, policy, run, removalDone, dependentsOf);
         if (!result.healed) {
             for (const auto* c : covered) {
                 out.failedEntries.emplace_back(c->target, c->version);
+            }
+            // R3's terminal, worst-case outcome: `remove --force` actually
+            // dropped the records and the reinstall that was meant to put
+            // them back failed too. `result.rung == "reinstall"` alone does
+            // not say this -- the OTHER `!healed` shape from that rung
+            // ("`remove --force` did not drop it") also reports rung
+            // "reinstall" when its own install attempt happened to succeed.
+            // `removalDone` is what actually tells the two apart: it is the
+            // same, side-effect-free query `repair_one` itself just asked
+            // (re-detect from the versions DB, no mutation), so calling it
+            // again here reads back the identical verdict rather than
+            // re-deriving it from `result.note`'s wording.
+            if (result.rung == "reinstall" && removalDone
+                && removalDone(coord.package, coord.version)) {
+                out.removedNotReinstalled.push_back(coord.canonical());
+
+                // `remove --force` bypasses cmd_remove's own reverse-
+                // dependency guard by design (this ladder rung already
+                // decided the removal has to happen) -- but bypassing the
+                // question is not the same as it having no answer.
+                // `result.dependents` is that answer, asked once inside
+                // `repair_one` itself for exactly this outcome (see
+                // DependentsProvider): whatever named this package as a
+                // runtime dependency is now broken, and this is the only
+                // place that will ever say so.
+                if (!result.dependents.empty()) {
+                    std::string names;
+                    for (const auto& d : result.dependents) {
+                        if (!names.empty()) names += ", ";
+                        names += std::format("{}@{}", d.name, d.version);
+                    }
+                    out.notes.emplace_back(
+                        glyph::mark(glyph::failed, "may be broken"),
+                        std::format(
+                            "{} may be broken -- {} depended on {}, which "
+                            "is now gone and could not be put back",
+                            names,
+                            result.dependents.size() == 1 ? "it" : "they",
+                            coord.canonical()));
+                }
             }
             out.notes.emplace_back(glyph::mark(glyph::failed, "repair failed"), std::format(
                 "{} — {}", coord.canonical(),
@@ -3282,7 +3701,8 @@ void repair_inactive_(const Scan& scan, const std::string& client,
 // `installation_state` report Incomplete, which is what makes the installer
 // run the hook again instead of concluding "already installed" from the files
 // the failure left behind.
-void repair_incomplete_(const Scan& scan, const CommandRunner& run,
+void repair_incomplete_(const Scan& scan, const std::string& client,
+                        const CommandRunner& run,
                         bool dryRun, RepairReport& out,
                         const std::function<void(std::string_view)>& onStep = {}) {
     for (const auto& f : scan.findings) {
@@ -3314,7 +3734,21 @@ void repair_incomplete_(const Scan& scan, const CommandRunner& run,
             onStep(std::format("reinstalling {} (may download)",
                                xvm::display_coordinate(f.target, f.version)));
         }
-        if (run(f.remedy + quiet_suffix()) == 0) {
+        // `f.remedy` is `"xlings install <coordinate>"` -- correct as
+        // PRINTED advice (the user's own `xlings` is what their shell
+        // resolves), wrong as a command THIS process runs: bare `xlings`
+        // depends on PATH, which is exactly what doctor cannot assume --
+        // it can be started by absolute path (the upgrade simulation does
+        // this to test a candidate build), and a home with no shim on
+        // PATH at all made this rung silently no-op with "command not
+        // found" swallowed by `quiet_suffix()`. Same fix repair_payloads_
+        // already applies to its own R2/R3 commands; substitute the
+        // running client in for the leading word rather than trusting it.
+        const auto space = f.remedy.find(' ');
+        const auto actualCmd = space == std::string::npos
+            ? f.remedy
+            : client + f.remedy.substr(space);
+        if (run(actualCmd + quiet_suffix()) == 0) {
             out.notes.emplace_back(glyph::mark(glyph::bullet, "reinstalled"),
                                    xvm::display_coordinate(f.target, f.version));
         } else {
@@ -3726,42 +4160,9 @@ void prune_dead_registrations_(const DoctorState& st, const Scan& remaining,
 
     std::size_t dropped = 0;
     for (const auto& [target, version] : victims) {
-        const auto infoIt = db.find(target);
-        if (infoIt == db.end()) continue;
-        if (infoIt->second.versions.erase(version) == 0) continue;
-        ++dropped;
-        out.notes.emplace_back(glyph::mark(glyph::bullet, "dropped"), std::format(
-            "{} — its payload is gone and nothing can restore it",
-            xvm::display_coordinate(target, version)));
-        out.prunedEntries.emplace_back(target, version);
-
-        if (const auto wit = ws.find(target);
-            wit != ws.end() && wit->second == version) {
-            ws.erase(wit);
-        }
-        if (const auto iit = installed.find(target); iit != installed.end()) {
-            std::erase(iit->second, version);
-            if (iit->second.empty()) installed.erase(iit);
-        }
-        // Edges into the removed version would outlive it and make every
-        // release it touched unresolvable.
-        for (auto& [_, info] : db) {
-            for (auto edgeIt = info.bindings.begin();
-                 edgeIt != info.bindings.end();) {
-                if (edgeIt->first == target) {
-                    std::erase_if(edgeIt->second, [&](const auto& edge) {
-                        return edge.second == version;
-                    });
-                }
-                if (edgeIt->second.empty()) {
-                    edgeIt = info.bindings.erase(edgeIt);
-                } else {
-                    ++edgeIt;
-                }
-            }
-        }
-        if (infoIt->second.versions.empty()) {
-            db.erase(infoIt);
+        if (prune_one_(db, ws, installed, target, version, out,
+                       "its payload is gone and nothing can restore it")) {
+            ++dropped;
         }
     }
     if (dropped > 0) {
@@ -3907,6 +4308,10 @@ Counts count_(const Scan& scan) {
                 // rather than as "healed 0" with a list of things it did.
                 if (duplicateReleases.insert(f.groupKey).second) ++c.binding;
                 break;
+            // A Warning, not an Error: the unreadable subos is one package's
+            // worth of damage, and it must not move the exit code the way an
+            // Error-level finding would.
+            case FindingKind::SubosUnreadable: ++c.warnings; break;
         }
     }
     return c;
@@ -3974,6 +4379,17 @@ void render_(const Scan& scan, const RepairReport& repair, bool fix,
             add("  " + glyph::mark(glyph::remedy, "run"), head->remedy);
             if (!head->remedyNote.empty())
                 add("  " + glyph::mark(glyph::note, "note"), head->remedyNote);
+        } else if (!scan.probeAvailable) {
+            // No catalog was built for this scan -- "no remedy" here is
+            // "unknown", not "no package exists". Saying the latter when the
+            // index was simply never consulted is the same false negative
+            // D1 exists to remove, one level down: the catalog can fail to
+            // rebuild (see cmd_doctor) even though it is now always
+            // attempted, and that failure must not read as a verdict about
+            // the package.
+            add("  " + glyph::mark(glyph::note, "no remedy"),
+                std::string("index unavailable — could not check whether a "
+                            "package provides this entry"));
         } else {
             // No command would help. Saying that is the useful output; a
             // plausible-looking `xlings install <target>` is not.
@@ -4281,6 +4697,11 @@ void render_(const Scan& scan, const RepairReport& repair, bool fix,
                     add("  " + glyph::mark(glyph::note, "note"), f.remedyNote);
                 break;
             }
+            case FindingKind::SubosUnreadable:
+                add(glyph::mark(glyph::warn, "subos unreadable"), f.detail);
+                if (!f.remedyNote.empty())
+                    add("  " + glyph::mark(glyph::note, "note"), f.remedyNote);
+                break;
             default: break;
         }
     }
@@ -4416,7 +4837,8 @@ void render_(const Scan& scan, const RepairReport& repair, bool fix,
         // exit code: they belong to a subos this run is not in.
         if (counts.foreignPayloads > 0)
             add("owned by another subos", std::format(
-                "{} — repair them there", counts.foreignPayloads));
+                "{} in other subos — --fix repairs them there",
+                counts.foreignPayloads));
         if (counts.otherSubos > 0)
             add("other subos findings", std::to_string(counts.otherSubos));
     }
@@ -4432,15 +4854,23 @@ void render_(const Scan& scan, const RepairReport& repair, bool fix,
         add("hint", "run `xlings self doctor --fix` to repair", true);
     }
 
-    // The nudge, for a home an older client set up. Last field of the same
-    // panel rather than a panel of its own: a second panel renders its own
-    // (empty) header, which reads as a broken frame rather than a footnote.
-    // Gated on the recorded version differing from the running one, which is
-    // what makes a successful `--fix` turn it off rather than merely quieten
-    // it.
-    if (auto hint = migration_hint(Config::recorded_client_version(),
-                                   Info::VERSION)) {
-        add(glyph::mark(glyph::note, "migration"), *hint);
+    // The nudge, for a home the running client has not yet verified. Last
+    // field of the same panel rather than a panel of its own: a second panel
+    // renders its own (empty) header, which reads as a broken frame rather
+    // than a footnote.
+    //
+    // Gated on `recorded_verified_version() != Info::VERSION`, not on
+    // `migration_hint`'s own comparison -- a home the running client has
+    // already verified has nothing to report here even if `migration_hint`
+    // would otherwise have something to say about the SETUP version, and a
+    // successful `--fix` stamping "verifiedBy" is what turns this field off.
+    if (auto verified = Config::recorded_verified_version();
+        verified != Info::VERSION) {
+        if (auto hint = migration_hint(
+                Config::recorded_client_version(),
+                verified.empty() ? std::string(Info::VERSION) : verified)) {
+            add(glyph::mark(glyph::note, "home"), *hint);
+        }
     }
 
     nlohmann::json payload;
@@ -4449,7 +4879,34 @@ void render_(const Scan& scan, const RepairReport& repair, bool fix,
     stream.emit(DataEvent{"info_panel", payload.dump()});
 }
 
-int cmd_doctor(EventStream& stream, bool fix, bool resetMetadata, bool dryRun, bool verbose, bool deep, std::optional<std::string> scope) {
+int cmd_doctor(EventStream& stream, bool fix, bool resetMetadata, bool dryRun, bool showOk, bool deep, std::optional<std::string> scope, std::optional<std::string> subos) {
+    // `--subos <name>` anchors this WHOLE process to that subos before
+    // anything else reads Config -- `load_state_` below is what derives the
+    // workspace, the shim table and the sysroot scope from it, and Config's
+    // effective paths are cached, so overriding after that point would leave
+    // some readers looking at the old subos. Both the override and the env
+    // var are set, and for the same reason subos.cpp's `create`/`rebind` set
+    // both: the override recomputes THIS process's cached paths, and
+    // XLINGS_ACTIVE_SUBOS is what every subprocess this run spawns
+    // (`xlings install`, `xlings use`, and — see the cross-subos walk near
+    // the end of this function — a nested `self doctor --fix`) re-reads for
+    // itself. Setting only the override would repair the right subos while
+    // every command it prints or runs underneath still believed it was in
+    // the one this process started in.
+    if (subos) {
+        const auto names = Config::list_subos_names();
+        if (std::ranges::find(names, *subos) == names.end()) {
+            stream.emit(ErrorEvent{
+                .code = ErrorCode::InvalidInput,
+                .message = std::format("subos '{}' not found", *subos),
+                .recoverable = false,
+            });
+            return 2;
+        }
+        platform::set_env_variable("XLINGS_ACTIVE_SUBOS", *subos);
+        Config::set_active_subos_override(*subos);
+    }
+
     // `--fix` implies `--deep`. Deliberate and load-bearing: the repair must
     // be able to act on findings only the payload audit produces, and
     // self_doctor_depth_test asserts it ("--fix retains the historical deep
@@ -4553,16 +5010,25 @@ int cmd_doctor(EventStream& stream, bool fix, bool resetMetadata, bool dryRun, b
         stream.emit(LogEvent{LogLevel::info, std::move(detail)});
         std::cout.flush();
     };
-    // The catalog is needed by the REPAIR, not only by the audit — it is how a
-    // broken payload's owning package is found so `xlings install` can be run
-    // against it. Gating it on `deepAudit` alone was the bug in the first cut
-    // of this change: decoupling `--fix` from `--deep` silently took the
-    // catalog away too, and `--fix` stopped repairing a payload whose
-    // directory was simply gone. Caught by self_doctor_test S8b, which asserts
-    // the repair by looking at the filesystem rather than at what doctor
-    // claimed — which is why it could catch it at all.
-    if (deepAudit || fix) {
-        localCatalog.emplace();
+    // The catalog is needed by every plain report now, not only by the deep
+    // audit or the repair — it is how a broken payload's owning package is
+    // found so a remedy can be printed, or `xlings install` run against it.
+    // Gating it on `deepAudit`/`fix` was D1's bug to fix: a plain `self
+    // doctor` skipped this and then said "no package in any index provides
+    // this entry" for releases the index plainly does provide — measured on
+    // a real home, 100 entries (fd@10.4.2, go@1.26.2, …) that `--deep` alone
+    // resolved correctly. Building it unconditionally costs one local index
+    // read, not a network fetch (PackageCatalog::rebuild loads the synced
+    // repo(s) already on disk) — the expense this used to be confused with is
+    // the PAYLOAD walk `--deep` gates below, which is untouched.
+    //
+    // Failure to build is still not fatal outside `--scope` (`--scope`
+    // requires `--deep`, checked above, and needs the catalog to resolve its
+    // argument) — see Scan::probeAvailable for how the render layer tells
+    // "the index could not be consulted" apart from "no package provides
+    // this".
+    localCatalog.emplace();
+    {
         const auto rebuilt = localCatalog->rebuild();
         if (!rebuilt) {
             if (scope) {
@@ -4605,6 +5071,7 @@ int cmd_doctor(EventStream& stream, bool fix, bool resetMetadata, bool dryRun, b
             audit.scope = std::move(*resolved);
         }
     }
+    audit.probeAvailable = localCatalog.has_value();
 
     // One in-process probe cache for the whole command. The same candidate is
     // asked about once per finding it owns and again after repair passes.
@@ -4673,7 +5140,7 @@ int cmd_doctor(EventStream& stream, bool fix, bool resetMetadata, bool dryRun, b
     auto scan = detect_(state, probe, audit);
 
     if (!fix) {
-        render_(scan, repair, fix, dryRun, verbose, stream);
+        render_(scan, repair, fix, dryRun, showOk, stream);
             return count_(scan).issues() == 0 ? 0 : 1;
     }
 
@@ -4710,13 +5177,23 @@ int cmd_doctor(EventStream& stream, bool fix, bool resetMetadata, bool dryRun, b
         return platform::exec(cmd);
     };
 
+    // Guarded here, not inside repair_other_subos_walk_: a child invoked
+    // WITH --subos is already anchored to one subos and must not walk
+    // again, or two subprocesses would race to repair each other's findings
+    // (and, unguarded, never terminate).
+    const bool alreadyAnchored = subos.has_value();
+
     if (dryRun) {
         repair_relocation_(state, /*dryRun=*/true, repair);
         repair_local_(state, scan, repair, /*dryRun=*/true);
         repair_payloads_(state, scan, probe, /*dryRun=*/true, repair);
-        repair_incomplete_(scan, run, /*dryRun=*/true, repair);
+        repair_incomplete_(scan, client, run, /*dryRun=*/true, repair);
         repair_inactive_(scan, client, run, /*dryRun=*/true, repair);
-        render_(scan, repair, fix, dryRun, verbose, stream);
+        if (!alreadyAnchored) {
+            repair_other_subos_walk_(scan, client, /*dryRun=*/true, run,
+                                     repair);
+        }
+        render_(scan, repair, fix, dryRun, showOk, stream);
             return count_(scan).issues() == 0 ? 0 : 1;
     }
 
@@ -4760,6 +5237,7 @@ int cmd_doctor(EventStream& stream, bool fix, bool resetMetadata, bool dryRun, b
         if (localCatalog) {
             probed.clear();
             if (!localCatalog->rebuild(true)) localCatalog.reset();
+            audit.probeAvailable = localCatalog.has_value();
         }
         refresh();
     }
@@ -4774,7 +5252,17 @@ int cmd_doctor(EventStream& stream, bool fix, bool resetMetadata, bool dryRun, b
         stream.emit(LogEvent{LogLevel::info, std::string(msg)});
         std::cout.flush();
     };
-    repair_payloads_(state, scan, probe, /*dryRun=*/false, repair, announce);
+    repair_payloads_(state, scan, probe, /*dryRun=*/false, repair, announce,
+                     localCatalog ? &*localCatalog : nullptr);
+    refresh();
+
+    // Phase 2.5: subos this run does not own. See repair_other_subos_walk_
+    // for why this has to be a subprocess per subos and why `--subos`
+    // disarms it (alreadyAnchored, computed before the dry-run branch above).
+    if (!alreadyAnchored) {
+        repair_other_subos_walk_(scan, client, /*dryRun=*/false, run, repair,
+                                 announce);
+    }
     refresh();
 
     // Phase 2b: payloads whose own stamp records a failed install.
@@ -4782,7 +5270,7 @@ int cmd_doctor(EventStream& stream, bool fix, bool resetMetadata, bool dryRun, b
     // After the ladder and after a reload, so a payload the ladder already
     // reinstalled is no longer reported here -- the refresh above re-reads the
     // stamp, and a successful install overwrites the failure marker.
-    repair_incomplete_(scan, run, /*dryRun=*/false, repair, announce);
+    repair_incomplete_(scan, client, run, /*dryRun=*/false, repair, announce);
     refresh();
 
 
@@ -4879,7 +5367,17 @@ int cmd_doctor(EventStream& stream, bool fix, bool resetMetadata, bool dryRun, b
     std::set<std::pair<std::string, std::string>> stillFound;
     for (const auto& f : scan.findings) {
         if (f.kind == FindingKind::BrokenPayload
-            || f.kind == FindingKind::ForeignPayload) {
+            || f.kind == FindingKind::ForeignPayload
+            // An IncompletePayload finding is an Error-level finding
+            // `repair_incomplete_` explicitly tried to fix by re-running
+            // install() (see its own comment). If the reinstall failed, the
+            // marker is still on disk and this finding is re-detected by
+            // `refresh()` the same as before the ladder ran -- so it must
+            // gate the stamp/exit code exactly like a still-broken payload
+            // does. Before this, a home whose ONLY remaining defect was a
+            // failed reinstall could stamp `verifiedBy` and exit 0 while
+            // install() had never actually succeeded.
+            || f.kind == FindingKind::IncompletePayload) {
             stillFound.emplace(f.target, f.version);
         }
     }
@@ -4887,20 +5385,40 @@ int cmd_doctor(EventStream& stream, bool fix, bool resetMetadata, bool dryRun, b
     for (const auto& entry : repair.failedEntries) {
         if (stillFound.contains(entry)) ++outstanding;
     }
+    // A failed cross-subos child (repair_other_subos_walk_) is outstanding
+    // work unconditionally -- unlike failedEntries it has no (target,
+    // version) to look up in `stillFound`: the child exited already
+    // anchored to a subos THIS process never re-detects, so there is
+    // nothing here to re-check it against. Its mere presence in the list
+    // means that subos was not repaired, full stop, and it must gate the
+    // stamp and the exit code exactly like an outstanding failedEntries
+    // victim does.
+    outstanding += static_cast<int>(repair.failedSubos.size());
+    // A `removedNotReinstalled` victim is outstanding the same way, and for
+    // the same reason `failedSubos` is unconditional: R3 really did drop the
+    // registration, so `stillFound` -- built from RE-DETECTED findings --
+    // contains nothing to look this coordinate up against. The package is
+    // gone from the home and gone from `scan.findings` in the same instant;
+    // treating that as "no finding, therefore healed" is exactly the gap
+    // this field exists to close.
+    outstanding += static_cast<int>(repair.removedNotReinstalled.size());
 
     // Stamp the home with the client that just checked it.
     //
-    // `.xlings.json:version` records which xlings set the home up. Only `self
-    // install` ever wrote it, so `self update` -- which installs xlings@latest
-    // as a package -- left it reading the old version forever. Stamped here it
-    // becomes the migration marker: the hint appears while the home is behind
-    // and stops once a --fix has actually migrated the packages.
+    // `.xlings.json:verifiedBy` records which xlings last confirmed this
+    // home's registrations are readable in the running format -- distinct
+    // from `.xlings.json:version`, which `self install` moves on every
+    // upgrade whether or not anything was ever checked. Stamped here it
+    // becomes the migration marker: the hint appears while a home is ahead
+    // of its last verification and stops once a `--fix` has actually
+    // migrated the packages.
     //
-    // Gated on the repairs this pass OWNS, not on a spotless home. doctor also
-    // reports things --fix is not responsible for -- unresolvable aliases,
-    // shim anchoring, another subos's broken payload -- and requiring zero of
-    // those would mean the marker never lands and the hint nags forever about
-    // a migration that already happened.
+    // Gated on the repairs THIS PASS OWNS (`outstanding`), not on a spotless
+    // home: doctor also reports things `--fix` is not responsible for --
+    // unresolvable aliases, shim anchoring, another subos's broken payload --
+    // and requiring zero of those would mean the marker never lands and the
+    // hint nags forever about a migration that already happened. A foreign
+    // payload is one such finding, so it no longer gates the stamp either.
     //
     // A read-only home is a legitimate environment (a sandbox, a read-only
     // mount), and this used to be the one writer in the run that could not
@@ -4911,20 +5429,20 @@ int cmd_doctor(EventStream& stream, bool fix, bool resetMetadata, bool dryRun, b
     // since it was written; the two now share one fate, which includes being
     // stamped BEFORE the report, so a failure to stamp is a line IN it rather
     // than a stray one underneath.
-    if (outstanding == 0 && after.foreignPayloads == 0) {
-        if (auto stamped = Config::record_client_version(
+    if (outstanding == 0) {
+        if (auto stamped = Config::record_verified_version(
                 std::string(Info::VERSION));
             !stamped) {
             repair.notes.emplace_back(
                 glyph::mark(glyph::failed, "home stamp"),
-                std::format("could not record the client version in {}: {}",
+                std::format("could not record the verified version in {}: {}",
                             Config::display_path(
                                 Config::paths().homeDir / ".xlings.json"),
                             stamped.error()));
         }
     }
 
-    render_(scan, repair, fix, dryRun, verbose, stream);
+    render_(scan, repair, fix, dryRun, showOk, stream);
 
     return (after.issues() == 0 && outstanding == 0 && !repair.regressed)
         ? 0 : 1;

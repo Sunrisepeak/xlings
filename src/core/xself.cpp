@@ -35,6 +35,7 @@ import xlings.core.xself.compat;
 import xlings.libs.json;
 import xlings.runtime;
 import xlings.cli.spec;
+import xlings.core.log;
 
 namespace xlings::xself {
 
@@ -51,7 +52,7 @@ int cmd_help(EventStream& stream) {
         {{"name", "config"},    {"desc", "Show configuration details"}},
         {{"name", "clean"},     {"desc", "Remove cache + gc orphaned packages (--dry-run)"}},
         {{"name", "migrate"},   {"desc", "Migrate old layout to subos/default"}},
-        {{"name", "doctor"},    {"desc", "Verify workspace/shim consistency (--deep for payload/runtime audits, optionally --scope PACKAGE[@VERSION]; --fix implies deep, --dry-run previews repairs, --all lists non-defects, --reset-metadata discards unreadable release metadata)"}},
+        {{"name", "doctor"},    {"desc", "Verify workspace/shim consistency (--deep for payload/runtime audits, optionally --scope PACKAGE[@VERSION]; --subos NAME checks/repairs a specific subos; --fix implies deep and walks every subos with findings; --dry-run previews repairs, --show-ok lists non-defects, --reset-metadata discards unreadable release metadata)"}},
     });
     stream.emit(DataEvent{"help", payload.dump()});
     return 0;
@@ -130,9 +131,10 @@ int run(int argc, char* argv[], EventStream& stream) {
         bool fix = false;
         bool resetMetadata = false;
         bool dryRun = false;
-        bool verbose = false;
+        bool showOk = false;
         bool deep = false;
         std::optional<std::string> scope;
+        std::optional<std::string> subos;
         for (std::size_t i = 0; i < args.size(); ++i) {
             const auto& arg = args[i];
             if (arg == "--fix") fix = true;
@@ -152,7 +154,16 @@ int run(int argc, char* argv[], EventStream& stream) {
             // log level with it) and is STRIPPED from argv before this
             // dispatch ever runs, so a `--verbose` here would be documented in
             // the help text and silently do nothing.
-            else if (arg == "--all") verbose = true;
+            else if (arg == "--show-ok") showOk = true;
+            // Deprecated spelling. Kept working -- a script that already
+            // types `--all` must not start failing -- but nudged once per
+            // run rather than removed silently, which is how a flag's
+            // meaning drifts out from under a script with nobody noticing.
+            else if (arg == "--all") {
+                showOk = true;
+                log::warn("--all now means --show-ok; --all is kept as an "
+                          "alias but will stop being documented");
+            }
             else if (arg == "--deep") deep = true;
             else if (arg == "--scope") {
                 if (i + 1 >= args.size() || args[i + 1].starts_with('-')) {
@@ -175,12 +186,33 @@ int run(int argc, char* argv[], EventStream& stream) {
                     return 2;
                 }
                 scope = value;
+            } else if (arg == "--subos") {
+                if (i + 1 >= args.size() || args[i + 1].starts_with('-')) {
+                    stream.emit(ErrorEvent{
+                        .code = ErrorCode::InvalidInput,
+                        .message = "missing value for option: --subos",
+                        .recoverable = false,
+                    });
+                    return 2;
+                }
+                subos = args[++i];
+            } else if (arg.starts_with("--subos=")) {
+                const auto value = arg.substr(std::string("--subos=").size());
+                if (value.empty()) {
+                    stream.emit(ErrorEvent{
+                        .code = ErrorCode::InvalidInput,
+                        .message = "missing value for option: --subos",
+                        .recoverable = false,
+                    });
+                    return 2;
+                }
+                subos = value;
             } else {
                 return reject("doctor", arg);
             }
         }
-        return cmd_doctor(stream, fix, resetMetadata, dryRun, verbose,
-                          deep, std::move(scope));
+        return cmd_doctor(stream, fix, resetMetadata, dryRun, showOk,
+                          deep, std::move(scope), std::move(subos));
     }
     // help / unknown-action handling. Distinguish a deliberate help
     // request (no action / -h / --help) from a typo / made-up action so

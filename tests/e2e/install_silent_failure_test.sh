@@ -22,6 +22,10 @@
 #       the exact failure mode mcpp tripped over
 #   S3: install_summary event must report failed=1 (sanity check on
 #       the existing instrumentation we're now propagating to exitCode)
+#   S4: `self doctor --fix -y` against the same always-fails payload must
+#       exit non-zero and must NOT stamp `verifiedBy` — an IncompletePayload
+#       finding that survives the repair ladder is an outstanding failure,
+#       not a silently-accepted one (2026.9.12 Item B)
 #
 # The downloader size-check (P1 fix) cannot be exercised here without
 # spinning up an HTTPS server with a trusted cert (tinyhttps rejects
@@ -242,5 +246,40 @@ leftover="$(ls -A "$VERDIR" 2>/dev/null | grep -v "^${STAMP}\$" || true)"
 $(ls -la "$VERDIR")"
 
 log "  ✓ brokenpkg verdir has no payload and records the failed install"
+
+# ── S4: an IncompletePayload finding that SURVIVES the repair ladder
+#        blocks the verified stamp and the exit code (2026.9.12, Item B) ──
+#
+# brokenpkg's install() hook always returns false, so `self doctor --fix`'s
+# own reinstall attempt (repair_incomplete_) fails exactly the same way the
+# original install did — the marker is still on disk after `--fix` runs,
+# re-detected as IncompletePayload on the very same re-scan. Before this,
+# `outstanding` only looked at BrokenPayload/ForeignPayload findings, so a
+# home whose ONLY remaining defect was this failed reinstall could still
+# stamp `verifiedBy` and report success while returning 1 — a straight
+# contradiction between the stamp and the exit code.
+log "S4: self doctor --fix -y on a payload whose install() always fails"
+set +e
+out_doctor="$(RUN self doctor --fix -y 2>&1)"
+rc_doctor=$?
+set -e
+echo "$out_doctor" | tail -20 | sed 's/^/    | /'
+
+[[ "$rc_doctor" -ne 0 ]] \
+  || fail "S4: self doctor --fix -y should exit non-zero while brokenpkg's reinstall keeps failing
+$out_doctor"
+
+[[ -f "$VERDIR/$STAMP" ]] \
+  || fail "S4: the incomplete marker should still be there — its own reinstall keeps failing"
+grep -q '"incomplete"[[:space:]]*:[[:space:]]*true' "$VERDIR/$STAMP" \
+  || fail "S4: the marker must still say incomplete after the failed re-fix attempt"
+
+s4_verified="$(python3 -c "
+import json, pathlib
+print(json.loads(pathlib.Path('$HOME_DIR/.xlings.json').read_text()).get('verifiedBy', ''))
+")"
+[[ -z "$s4_verified" ]] \
+  || fail "S4: verifiedBy must not be written while an IncompletePayload finding survived the fix; got '$s4_verified'"
+log "  ✓ doctor --fix exited $rc_doctor and did not stamp verifiedBy"
 
 log "PASS: cmd_install exit-code propagation regression covered"
