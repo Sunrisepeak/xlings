@@ -87,6 +87,21 @@ ParsedPackageTarget parse_package_target(std::string target) {
 
 namespace detail_ {
 
+// Every version key of one platform table with aliases followed to what they
+// name, "latest" excluded, duplicates collapsed. The result is the set of
+// versions that can exist as a store directory.
+std::vector<std::string> concrete_versions_(
+    const std::unordered_map<std::string, xpkg::PlatformResource>& versions) {
+    std::vector<std::string> out;
+    std::unordered_set<std::string> seen;
+    for (const auto& [ver, entry] : versions) {
+        if (ver == "latest") continue;
+        const std::string& concrete = entry.ref.empty() ? ver : entry.ref;
+        if (seen.insert(concrete).second) out.push_back(concrete);
+    }
+    return out;
+}
+
 std::string select_version_(const xpkg::Package& pkg,
                             const std::string& platform,
                             const std::string& versionHint) {
@@ -100,12 +115,16 @@ std::string select_version_(const xpkg::Package& pkg,
         if (directIt != versions.end()) {
             return directIt->second.ref.empty() ? versionHint : directIt->second.ref;
         }
-        // Semver range/prefix matching against available versions
-        std::vector<std::string> available;
-        for (auto& [ver, _] : versions) {
-            if (ver != "latest") available.push_back(ver);
-        }
-        return semver::select_best(available, versionHint);
+        // Semver range/prefix matching against CONCRETE versions only.
+        //
+        // An alias entry (`["25.0.4"] = { ref = "25.0.4+7" }`) is a name for
+        // another key, not a version that exists on disk. The exact-match
+        // branch above has always dereferenced it; this branch used to hand
+        // every key to the range matcher, so `>=11` could pick the alias
+        // string itself and `dep_install_dir` then named a directory that was
+        // never installed (#590). Dereference here too, so both branches
+        // answer with a key the store can hold.
+        return semver::select_best(concrete_versions_(versions), versionHint);
     }
 
     // No hint: resolve "latest" ref or pick highest
@@ -114,10 +133,7 @@ std::string select_version_(const xpkg::Package& pkg,
         return latestIt->second.ref;
     }
 
-    std::vector<std::string> available;
-    for (auto& [ver, _] : versions) {
-        if (ver != "latest") available.push_back(ver);
-    }
+    auto available = concrete_versions_(versions);
     if (!available.empty()) {
         semver::sort_desc(available);
         return available[0];

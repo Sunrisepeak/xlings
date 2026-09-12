@@ -1010,3 +1010,70 @@ TEST(XimDemotionNotice, BehindLocalCopyNotesOnce) {
     EXPECT_FALSE(xlings::xim::detail_::demotion_notice("xlings", chosen, memo));
     EXPECT_EQ(counting.markCalls, 1);
 }
+
+// ============================================================
+// #590 — a version alias is a name for another key, not a version that
+// exists on disk. Range and no-hint selection must answer with the key the
+// store can hold; the exact-match branch has always dereferenced it.
+// ============================================================
+
+namespace {
+
+mcpplibs::xpkg::Package aliased_jdk_() {
+    mcpplibs::xpkg::Package pkg;
+    pkg.name = "jdk-temurin";
+    pkg.spec = "1";
+    mcpplibs::xpkg::PlatformResource real;
+    real.url = "https://example.com/jdk-25.0.4+7.tar.gz";
+    mcpplibs::xpkg::PlatformResource alias;
+    alias.ref = "25.0.4+7";
+    mcpplibs::xpkg::PlatformResource latest;
+    latest.ref = "25.0.4+7";
+    pkg.xpm.entries["linux"]["25.0.4+7"] = real;
+    pkg.xpm.entries["linux"]["25.0.4"] = alias;
+    pkg.xpm.entries["linux"]["latest"] = latest;
+    return pkg;
+}
+
+}  // namespace
+
+TEST(XimSelectVersionAlias, RangeHintNeverPicksAnAliasKey) {
+    const auto pkg = aliased_jdk_();
+    EXPECT_EQ(xlings::xim::detail_::select_version_(pkg, "linux", ">=11"),
+              "25.0.4+7");
+    EXPECT_EQ(xlings::xim::detail_::select_version_(pkg, "linux", "^25"),
+              "25.0.4+7");
+}
+
+TEST(XimSelectVersionAlias, ExactAliasHintStillDereferences) {
+    const auto pkg = aliased_jdk_();
+    EXPECT_EQ(xlings::xim::detail_::select_version_(pkg, "linux", "25.0.4"),
+              "25.0.4+7");
+}
+
+TEST(XimSelectVersionAlias, NoHintWithoutLatestPicksAConcreteKey) {
+    mcpplibs::xpkg::Package pkg;
+    pkg.name = "android-platform";
+    pkg.spec = "1";
+    mcpplibs::xpkg::PlatformResource real;
+    real.url = "https://example.com/platform-35_r2.zip";
+    mcpplibs::xpkg::PlatformResource alias;
+    alias.ref = "35-r2";
+    pkg.xpm.entries["linux"]["35-r2"] = real;
+    pkg.xpm.entries["linux"]["35"] = alias;
+    EXPECT_EQ(xlings::xim::detail_::select_version_(pkg, "linux", ""),
+              "35-r2");
+}
+
+TEST(XimSelectVersionAlias, AnAliasToAMissingKeyStillNamesItsTarget) {
+    mcpplibs::xpkg::Package pkg;
+    pkg.name = "x";
+    pkg.spec = "1";
+    mcpplibs::xpkg::PlatformResource alias;
+    alias.ref = "2.0.0";
+    pkg.xpm.entries["linux"]["2"] = alias;
+    // The alias is the only entry; its target is what a store directory would
+    // be called, so that is the answer -- never the alias string.
+    EXPECT_EQ(xlings::xim::detail_::select_version_(pkg, "linux", ">=1"),
+              "2.0.0");
+}
