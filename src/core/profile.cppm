@@ -96,8 +96,14 @@ export bool save_subos_workspace(const fs::path& subosRoot,
                                  const xvm::SubosWorkspace& workspace);
 
 // Find which subos environments reference a given package target name.
+//
+// `unreadable`, when given, collects the name of every subos this scan could
+// not read at all (see load_subos_snapshots) -- a caller that needs to know
+// whether the returned list might be missing a subos that is silently using
+// the target can check it rather than trusting an empty/short result.
 export std::vector<std::string> find_subos_referencing(
-        const fs::path& xlingsHome, const std::string& target);
+        const fs::path& xlingsHome, const std::string& target,
+        std::vector<std::string>* unreadable = nullptr);
 
 // Which subos still pin an EXACT version of a target.
 //
@@ -113,10 +119,17 @@ export std::vector<std::string> find_subos_referencing(
 // Namespace handling mirrors is_version_referenced_anywhere_: stored values
 // are namespaced for non-primary index repos (`local:0.0.1`), and the two must
 // agree or this would omit a subos that really is holding the payload down.
+//
+// `unreadable`, when given, collects the name of every subos whose workspace
+// file could not be read -- an unreadable subos can neither be confirmed nor
+// ruled out as pinning the version, and a caller deciding whether it is safe
+// to delete a payload needs to see that gap rather than have it silently
+// read as "does not pin it".
 export std::vector<std::string> find_subos_pinning_version(
         const fs::path& xlingsHome,
         const std::string& target,
-        const std::string& version);
+        const std::string& version,
+        std::vector<std::string>* unreadable = nullptr);
 
 export int gc(const fs::path& xlingsHome, bool dryRun = false);
 

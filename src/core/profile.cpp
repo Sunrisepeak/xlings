@@ -290,9 +290,10 @@ std::set<std::string> collect_subos_references_(const fs::path& xlingsHome) {
 }
 
 std::vector<std::string> find_subos_referencing(
-        const fs::path& xlingsHome, const std::string& target) {
+        const fs::path& xlingsHome, const std::string& target,
+        std::vector<std::string>* unreadable) {
     std::vector<std::string> result;
-    for (auto& snapshot : load_subos_snapshots(xlingsHome)) {
+    for (auto& snapshot : load_subos_snapshots(xlingsHome, unreadable)) {
         if (snapshot.workspace.active.contains(target)
             || snapshot.workspace.installed.contains(target)) {
             result.push_back(snapshot.name);
@@ -304,7 +305,8 @@ std::vector<std::string> find_subos_referencing(
 std::vector<std::string> find_subos_pinning_version(
         const fs::path& xlingsHome,
         const std::string& target,
-        const std::string& version) {
+        const std::string& version,
+        std::vector<std::string>* unreadable) {
     // Both spellings of a key name the same record; see
     // xvm::version_key_matches for which spellings those are.
     auto matches = [&](std::string_view stored) {
@@ -312,7 +314,7 @@ std::vector<std::string> find_subos_pinning_version(
     };
 
     std::vector<std::string> result;
-    for (auto& snapshot : load_subos_snapshots(xlingsHome)) {
+    for (auto& snapshot : load_subos_snapshots(xlingsHome, unreadable)) {
         const auto& ws = snapshot.workspace;
         bool pinned = false;
         if (auto it = ws.active.find(target);

@@ -429,10 +429,15 @@ xvm::SubosWorkspace load_workspace_file_(const std::filesystem::path& path);
 // but no longer selects a side.
 std::vector<std::filesystem::path> workspace_config_paths_for_scope_(PackageScope scope);
 
+// `force` only changes the wording of the warning emitted when a subos's
+// workspace file cannot be read -- an unreadable subos is treated as
+// referencing the version regardless of `force` (see the .cpp for why: it is
+// a different subos's state, not this command's own objection to override).
 bool is_version_referenced_anywhere_(PackageScope scope,
                                      const std::string& target,
                                      const std::string& version,
-                                     const std::filesystem::path& excludePath = {});
+                                     const std::filesystem::path& excludePath = {},
+                                     bool force = false);
 
 void remove_target_shims_(const std::string& target, const std::string& version);
 
@@ -552,9 +557,17 @@ public:
         bool recipeUnavailable { false };
     };
 
-    // Uninstall a package
+    // Uninstall a package.
+    //
+    // `force` only affects the wording of the warning emitted when a
+    // referencing subos's workspace file cannot be read (see
+    // is_version_referenced_anywhere_ in installer.cpp) -- it does NOT
+    // override the detach-only decision. Deleting a payload another subos
+    // may still be using is not what `--force` on THIS removal means; it
+    // would be damaging a different subos's state, not just forcing past
+    // this command's own objections.
     std::expected<UninstallOutcome, std::string>
-    uninstall(const std::string& name);
+    uninstall(const std::string& name, bool force = false);
 
 private:
     static std::string detect_platform_();

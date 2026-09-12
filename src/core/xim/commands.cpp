@@ -1131,7 +1131,7 @@ int cmd_remove_resolved_(const std::string& target,
     }
 
     Installer installer(catalog);
-    auto result = installer.uninstall(resolveTarget);
+    auto result = installer.uninstall(resolveTarget, force);
     if (!result) {
         log::error("uninstall failed: {}", result.error());
         return 1;
@@ -1196,11 +1196,24 @@ int cmd_remove_resolved_(const std::string& target,
 
     std::vector<std::string> pinnedBy;
     if (result->detachedOnly) {
+        std::vector<std::string> unreadable;
         pinnedBy = xlings::profile::find_subos_pinning_version(
             Config::paths().homeDir,
             result->target.empty() ? displayName : result->target,
-            result->version.empty() ? displayVersion : result->version);
+            result->version.empty() ? displayVersion : result->version,
+            &unreadable);
         std::erase(pinnedBy, subos);
+        // An unreadable subos is exactly why the payload may have been kept
+        // (is_version_referenced_anywhere_ treats it the same way) --
+        // report it alongside the subos this scan could actually confirm,
+        // marked so the user knows it is a "could not tell" rather than a
+        // "confirmed still using it".
+        std::erase(unreadable, subos);
+        for (auto& name : unreadable) {
+            if (std::ranges::find(pinnedBy, name) == pinnedBy.end()) {
+                pinnedBy.push_back(name + " (unreadable)");
+            }
+        }
     }
 
     nlohmann::json summaryPayload;

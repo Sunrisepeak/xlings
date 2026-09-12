@@ -1315,13 +1315,56 @@ std::vector<std::filesystem::path> workspace_config_paths_for_scope_(PackageScop
     return paths;
 }
 
-bool is_version_referenced_anywhere_(PackageScope scope, const std::string& target, const std::string& version, const std::filesystem::path& excludePath) {
+bool is_version_referenced_anywhere_(PackageScope scope, const std::string& target, const std::string& version, const std::filesystem::path& excludePath, bool force) {
     std::error_code ec;
     auto excludeCanonical = excludePath.empty() ? std::filesystem::path{} : std::filesystem::weakly_canonical(excludePath, ec);
     for (auto& configPath : workspace_config_paths_for_scope_(scope)) {
         auto canonical = std::filesystem::weakly_canonical(configPath, ec);
         if (!excludeCanonical.empty() && !ec && canonical == excludeCanonical) {
             continue;
+        }
+
+        // A subos whose file simply doesn't exist yet has never referenced
+        // anything -- that is the ordinary "never used" state load_subos_
+        // snapshots also treats as empty, not a fault. Only a file that
+        // EXISTS but cannot be turned into a workspace is the controller
+        // ruling's "unreadable" case below.
+        std::error_code existsEc;
+        if (!std::filesystem::exists(configPath, existsEc)) continue;
+
+        // Controller ruling (2026.9.12): an unreadable subos must be
+        // treated as "might still use this payload", not as "does not use
+        // it". Silently reading it the second way is exactly how `xlings
+        // remove` did a FULL removal (payload deleted) while a corrupted
+        // sibling subos was still actively using the same version -- the
+        // corruption made the sibling invisible to this scan instead of
+        // making the scan refuse to guess. Erring toward "still
+        // referenced" only over-retains a payload GC can reclaim later
+        // once the file is fixed; the opposite error deletes something a
+        // live subos needs, with no way back.
+        //
+        // `--force` does NOT override this. Force on `remove <pkg>` means
+        // "remove this package even if this command would otherwise
+        // object" -- it does not mean "delete a payload a DIFFERENT,
+        // unrelated subos may still need". That would be damaging that
+        // other subos's state, not forcing this removal.
+        auto checkedSws = load_workspace_file_checked_(configPath);
+        if (!checkedSws) {
+            auto subosName = configPath.parent_path().filename().string();
+            log::warn(
+                "{}: its workspace file ({}) could not be read, so it is "
+                "not known whether it still uses {}@{} -- treating it as "
+                "still referencing the payload and keeping it (detach-only) "
+                "rather than risk deleting something that subos needs.{} "
+                "Run `xlings self doctor --subos {}` to repair it.",
+                subosName, configPath.string(), target, version,
+                force ? " --force does not override this: deleting a "
+                        "payload another subos may need is not \"force "
+                        "removing this package\", it is damaging that "
+                        "other subos."
+                      : "",
+                subosName);
+            return true;
         }
         // 0.4.19+: a payload is "referenced" by a subos if EITHER its
         // active version equals `version` OR `version` appears in that
@@ -1342,7 +1385,7 @@ bool is_version_referenced_anywhere_(PackageScope scope, const std::string& targ
         auto matches = [&](std::string_view stored) {
             return xvm::version_key_matches(version, stored);
         };
-        auto sws = load_workspace_file_(configPath);
+        auto& sws = *checkedSws;
         if (auto it = sws.active.find(target);
             it != sws.active.end() && matches(it->second)) return true;
         if (auto it = sws.installed.find(target); it != sws.installed.end()) {
@@ -2187,8 +2230,27 @@ bool process_xvm_operations_(const PlanNode& node,
     // looked up through `scopedDb`). So: read each other subos's own
     // workspace file directly -- read-only, and the version DB it is
     // resolved against stays the one this batch just registered.
-    for (const auto& otherSubos : xlings::profile::find_subos_pinning_version(
-             Config::paths().homeDir, node.name, node.version)) {
+    // `unreadable` names subos this scan could not even open to check --
+    // a subos whose file was already corrupted BEFORE this batch ran, so it
+    // never had the chance to be named as pinning anything (load_subos_
+    // snapshots skips it entirely, per its own doc comment). It might be
+    // the one pinning this exact version -- there is no way to tell -- so
+    // warn about it too, the same way the loop below warns about a file
+    // that turns out unreadable mid-scan.
+    std::vector<std::string> unreadableSubos;
+    auto pinningSubos = xlings::profile::find_subos_pinning_version(
+        Config::paths().homeDir, node.name, node.version, &unreadableSubos);
+    for (const auto& name : unreadableSubos) {
+        if (name == Config::paths().activeSubos) continue;
+        const auto configPath =
+            Config::paths().homeDir / "subos" / name / ".xlings.json";
+        log::warn(
+            "{}: its workspace file ({}) could not be read, so it is not "
+            "known whether it pins {}@{} -- its sysroot was NOT refreshed; "
+            "run `xlings self doctor --subos {}` to repair it",
+            name, configPath.string(), node.name, node.version, name);
+    }
+    for (const auto& otherSubos : pinningSubos) {
         if (otherSubos == Config::paths().activeSubos) continue;
         const auto otherSubosDir =
             Config::paths().homeDir / "subos" / otherSubos;
@@ -3350,7 +3412,7 @@ std::expected<void, std::string> Installer::execute(const InstallPlan& plan, con
 }
 
 
-std::expected<Installer::UninstallOutcome, std::string> Installer::uninstall(const std::string& name) {
+std::expected<Installer::UninstallOutcome, std::string> Installer::uninstall(const std::string& name, bool force) {
     auto platform = detect_platform_();
     auto currentWorkspacePath = detail_::current_workspace_config_path_();
 
@@ -3542,7 +3604,8 @@ std::expected<Installer::UninstallOutcome, std::string> Installer::uninstall(con
             resolvedMatch ? resolvedMatch->scope : PackageScope::Global,
             detachTarget,
             detachVersion,
-            currentWorkspacePath);
+            currentWorkspacePath,
+            force);
 
     if (stillReferenced) {
         detail_::detach_current_subos_(detachTarget, detachVersion);
