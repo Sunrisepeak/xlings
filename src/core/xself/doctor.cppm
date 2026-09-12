@@ -508,6 +508,17 @@ struct RepairReport {
     // anchored to it), so there is no `stillFound`-style check to run --
     // its mere presence in this list is the outstanding work.
     std::vector<std::pair<std::string, int>> failedSubos;
+    // Coordinates R3 genuinely REMOVED and then failed to put back.
+    //
+    // Unconditional, like `failedSubos`, and for the identical reason: this
+    // is the one ladder outcome where the finding it started from is
+    // GUARANTEED to be gone from re-detection -- the registration really
+    // was dropped -- so folding it into `failedEntries` and gating on
+    // `stillFound` would always read "healed" for a package the user just
+    // lost. `repair_one` already says so in its note ("REMOVED but could
+    // not reinstall"); this is what makes that sentence gate the stamp and
+    // the exit code instead of scrolling past as one more line of prose.
+    std::vector<std::string> removedNotReinstalled;
     // Commands `--dry-run` would have run.
     std::vector<std::string> planned;
     // `--fix` ended with more issues than it started with. Sets the exit code
