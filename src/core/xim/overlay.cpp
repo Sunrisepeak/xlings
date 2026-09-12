@@ -56,7 +56,12 @@ std::string mtime_utc_iso_(const fs::path& path) {
     std::error_code ec;
     auto ftime = fs::last_write_time(path, ec);
     if (ec) return "";
-    auto sysTime = std::chrono::clock_cast<std::chrono::system_clock>(ftime);
+    // Not std::chrono::clock_cast: libc++ (macOS / Windows CI) does not ship
+    // it. Re-basing through "now" on both clocks is exact to the clock
+    // resolution and portable across all four toolchains this project builds
+    // with.
+    const auto sysTime = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+        ftime - fs::file_time_type::clock::now() + std::chrono::system_clock::now());
     return iso_utc_from_time_t_(std::chrono::system_clock::to_time_t(sysTime));
 }
 
@@ -159,9 +164,14 @@ std::vector<DiscoveredEntry> load_with_files(const fs::path& dir) {
     std::error_code ec;
     if (!fs::is_directory(pkgsDir, ec)) return out;
 
+    // `std::default_sentinel`, not `!= recursive_directory_iterator()`: under
+    // `import std` with libc++ (macOS / Windows CI) the iterator-vs-iterator
+    // comparison is not visible from a module implementation unit, and the
+    // range-for form fails the same way. profile.cpp walks with the sentinel
+    // for the same reason.
     for (auto it = fs::recursive_directory_iterator(
              pkgsDir, fs::directory_options::skip_permission_denied, ec);
-         !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+         !ec && it != std::default_sentinel; it.increment(ec)) {
         std::error_code fileEc;
         if (!it->is_regular_file(fileEc) || fileEc) continue;
         const auto& path = it->path();

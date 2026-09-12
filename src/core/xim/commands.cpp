@@ -1698,7 +1698,7 @@ ScopedSubosOverride::~ScopedSubosOverride() {
         (void)Config::set_active_subos_override(prevOverride_);
         Config::reload_state();
     } catch (const std::exception& e) {
-        log::debug("ScopedSubosOverride: restore failed: {}", e.what());
+        log::debug("ScopedSubosOverride: restore failed: {}", std::string(e.what()));
     } catch (...) {
         log::debug("ScopedSubosOverride: restore failed (unknown exception)");
     }
