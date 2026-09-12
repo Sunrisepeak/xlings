@@ -186,6 +186,10 @@ TESTS=(
     # An upgrade is announced once per home, not once per command, and
     # `self doctor --fix` stamps the verified version once it converges.
     "E2E-100|notice_once_test.sh||"
+    # The local overlay: provenance, the three verbs, and the GC that removes
+    # what the synced index has already caught up with. Task 4 of the
+    # 2026-09-12 robustness/usability round.
+    "E2E-101|local_overlay_test.sh||"
 )
 
 # ── orphan check: a test that runs NOWHERE looks exactly like one that passes ──

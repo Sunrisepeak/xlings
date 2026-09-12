@@ -918,6 +918,24 @@ int cmd_config_(const mcpplibs::cmdline::ParsedArgs& args, EventStream& stream) 
         return xim::cmd_add_xpkg(std::string(*xpkg), stream);
     }
 
+    // --list-xpkg
+    if (args.is_flag_set("list-xpkg")) {
+        if (!commit_edits()) return 1;
+        return xim::cmd_list_xpkg();
+    }
+
+    // --remove-xpkg <NAME>
+    if (auto name = args.value("remove-xpkg")) {
+        if (!commit_edits()) return 1;
+        return xim::cmd_remove_xpkg(std::string(*name));
+    }
+
+    // --clear-xpkg <all|stale>
+    if (auto what = args.value("clear-xpkg")) {
+        if (!commit_edits()) return 1;
+        return xim::cmd_clear_xpkg(std::string(*what));
+    }
+
     // --index-repo  namespace:https://....git
     if (auto repo = args.value("index-repo")) {
         std::string val(*repo);
@@ -1826,6 +1844,9 @@ int dispatch_(int argc, char* argv[]) {
             .option(cmdline::Option("theme").takes_value().value_name("THEME").help("Set colour theme (name or path)"))
             .option(cmdline::Option("interactive").takes_value().value_name("BOOL").help("Inline prompts in tui mode (true/false)"))
             .option(cmdline::Option("add-xpkg").takes_value().value_name("FILE").help("Add xpkg file to package index"))
+            .option(cmdline::Option("list-xpkg").help("List local recipes and how they relate to the synced index"))
+            .option(cmdline::Option("remove-xpkg").takes_value().value_name("NAME").help("Remove one local recipe"))
+            .option(cmdline::Option("clear-xpkg").takes_value().value_name("all|stale").help("Remove local recipes (all, or stale = identical/behind the synced index)"))
             .option(cmdline::Option("index-repo").takes_value().value_name("NS:URL").help("Add/update index repo (e.g. myns:https://...git)"))
             .action(wrap_rc([&stream](const cmdline::ParsedArgs& args) -> int {
                 apply_global_opts_(args);

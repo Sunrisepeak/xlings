@@ -23,6 +23,7 @@ import xlings.core.xim.repo;
 import xlings.core.xim.resolver;
 import xlings.core.xim.downloader;
 import xlings.core.xim.installer;
+import xlings.core.xim.overlay;
 // A leaf module -- it imports only std and the json wrapper -- so reading the
 // subos's own declaration here closes no cycle. The alternative was a second
 // manifest reader living in xim, and this repo has paid for "the same decision
@@ -1913,13 +1914,44 @@ int cmd_add_xpkg(const std::string& fileOrUrl, EventStream& stream) {
     // Move to letter subdirectory (build_index expects pkgs/<letter>/<name>.lua)
     auto name = pkg->name;
     if (name.empty()) name = luaFile.stem().string();
-    std::string letter(1, std::tolower(static_cast<unsigned char>(name[0])));
-    auto letterDir = pkgsDir / letter;
-    fs::create_directories(letterDir);
-    auto destFile = letterDir / luaFile.filename();
+    // <name>.lua, not the source's own filename: the overlay's provenance
+    // and its `list`/`remove`/`clear`/GC verbs all locate a recipe by name
+    // via `overlay::recipe_path`, which assumes this layout -- the same
+    // layout this comment already promised. A source file named anything
+    // else (a download whose URL basename differs from the package's
+    // declared name) used to land under ITS OWN filename, silently
+    // invisible to every one of those verbs.
+    auto destFile = overlay::recipe_path(localRepoDir, name);
+    fs::create_directories(destFile.parent_path());
     if (destFile != luaFile) {
         fs::rename(luaFile, destFile);
         luaFile = destFile;
+    }
+
+    // Refuse a recipe byte-identical to one the synced index (or a
+    // sub-index) already ships under the same name.
+    //
+    // A real overlay measured 159 recipes accumulated this way, 157 of them
+    // exactly this: the index had caught up since the day someone ran
+    // `--add-xpkg`, and the copy survived as pure shadow -- every bare-name
+    // resolution of it printed a namespace-priority warning for no reason at
+    // all. Catching it here means the overlay only ever grows with recipes
+    // that add something.
+    auto sha = overlay::file_sha256(luaFile);
+    for (auto& [repoName, upstreamPath] : overlay::upstream_candidates(name)) {
+        if (sha.empty() || overlay::file_sha256(upstreamPath) != sha) continue;
+        // Removes the file AND the letter directory `create_directories`
+        // just made above, if this was the only recipe in it -- a refusal
+        // should leave no trace, not an empty `pkgs/<letter>/`.
+        overlay::remove_recipe_file(luaFile);
+        diag::emit({
+            .level   = diag::Level::Note,
+            .code    = "xim.overlay_identical",
+            .summary = std::format("{} is identical to {}:{}; nothing to add",
+                                   name, repoName, name),
+            .actions = {{"install it", std::format("xlings install {}", name)}},
+        });
+        return 0;
     }
 
     // Give the local index the shared `libs/` too.
@@ -1965,12 +1997,134 @@ int cmd_add_xpkg(const std::string& fileOrUrl, EventStream& stream) {
         }
     }
 
+    // Provenance: what was added, from where, when, and at what declared
+    // version -- so `--list-xpkg` can say why a recipe is here instead of
+    // just that it is, and `xlings update`'s GC can tell "caught up" (no
+    // recorded version to fall behind) from "still ahead of the index".
+    {
+        auto entries = overlay::load(localRepoDir);
+        overlay::Entry entry;
+        entry.name    = name;
+        entry.source  = fileOrUrl;
+        entry.addedAt = overlay::now_utc_iso();
+        entry.sha256  = sha;
+        entry.version = overlay::declared_latest(luaFile).value_or("");
+        entries[name] = std::move(entry);
+        overlay::save(localRepoDir, entries);
+    }
+
     log::println("add xpkg - {}", luaFile.string());
     // Rebuild index so the new package is immediately available
     auto& catalog = get_catalog();
     // get_catalog() already triggers a rebuild on first call,
     // but the local repo was just modified so we need a fresh rebuild
     catalog.rebuild();
+    return 0;
+}
+
+int cmd_list_xpkg() {
+    auto dir = overlay::dir();
+    // `load_with_files`, not `load`: a pre-2026.9.12 `--add-xpkg` never
+    // wrote a provenance entry, and those recipes are most of a real
+    // overlay (159 on the machine that motivated this feature, 157 with no
+    // record at all). Listing only `.overlay.json` would say "empty" over
+    // an overlay full of exactly what this command exists to show.
+    auto discovered = overlay::load_with_files(dir);
+    if (discovered.empty()) {
+        log::println("no local recipes (add one with "
+                     "`xlings config --add-xpkg <file>`)");
+        return 0;
+    }
+    std::ranges::sort(discovered, {},
+                      [](auto& d) -> const std::string& { return d.entry.name; });
+
+    auto kind_label = [](overlay::Status::Kind k) -> std::string_view {
+        switch (k) {
+            case overlay::Status::Unique:    return "unique";
+            case overlay::Status::Identical: return "identical";
+            case overlay::Status::Modified:  return "modified";
+            case overlay::Status::Behind:    return "behind";
+        }
+        return "unique";
+    };
+
+    log::println("{:<24} {:<12} {:<10} {}", "name", "version", "status", "source");
+    for (auto& item : discovered) {
+        auto status = overlay::status_of(item.entry, item.path);
+        auto version = item.entry.version.empty() ? "-" : item.entry.version;
+        // "untracked": no provenance record exists for this recipe at all
+        // (added before this feature, or dropped into pkgs/ by hand) --
+        // distinct from a recorded-but-blank source, which this codebase
+        // never produces but which "unknown" would wrongly suggest.
+        auto source = item.entry.source.empty() ? "untracked" : item.entry.source;
+        log::println("{:<24} {:<12} {:<10} {}", item.entry.name, version,
+                     kind_label(status.kind), source);
+    }
+    return 0;
+}
+
+int cmd_remove_xpkg(const std::string& name) {
+    auto dir = overlay::dir();
+    auto entries = overlay::load(dir);
+    auto localFile = overlay::recipe_path(dir, name);
+    std::error_code ec;
+    bool hadFile = std::filesystem::is_regular_file(localFile, ec);
+    auto it = entries.find(name);
+    if (!hadFile && it == entries.end()) {
+        log::error("no local recipe named '{}'", name);
+        return 1;
+    }
+    overlay::remove_recipe_file(localFile);
+    if (it != entries.end()) entries.erase(it);
+    overlay::save(dir, entries);
+
+    log::println("removed local recipe '{}'", name);
+    get_catalog().rebuild();
+    return 0;
+}
+
+int cmd_clear_xpkg(const std::string& what) {
+    if (what != "all" && what != "stale") {
+        log::error("'{}' is not a --clear-xpkg category", what);
+        log::error("  hint: use `all` or `stale`");
+        return 2;
+    }
+
+    auto dir = overlay::dir();
+    // Same reasoning as `cmd_list_xpkg`: `--clear-xpkg all` (or a `stale`
+    // recipe long since caught up by the index) must reach an untracked
+    // recipe too, not just ones added since this feature shipped. Only
+    // entries that were ALREADY tracked are erased from `.overlay.json`
+    // below -- a surviving untracked recipe must not be adopted into
+    // provenance merely because this command looked at it.
+    auto tracked = overlay::load(dir);
+    auto discovered = overlay::load_with_files(dir);
+    std::vector<std::string> removed;
+    for (auto& item : discovered) {
+        bool shouldRemove = what == "all";
+        if (!shouldRemove) {
+            auto status = overlay::status_of(item.entry, item.path);
+            shouldRemove = status.kind == overlay::Status::Identical
+                        || status.kind == overlay::Status::Behind;
+        }
+        if (!shouldRemove) continue;
+        overlay::remove_recipe_file(item.path);
+        removed.push_back(item.entry.name);
+    }
+    for (auto& name : removed) tracked.erase(name);
+    overlay::save(dir, tracked);
+
+    if (removed.empty()) {
+        log::println("no local recipes matched '{}'", what);
+        return 0;
+    }
+    std::string joined;
+    for (auto& name : removed) {
+        if (!joined.empty()) joined += ", ";
+        joined += name;
+    }
+    log::println("removed {} local recipe(s): {}", removed.size(), joined);
+    get_catalog().rebuild();
     return 0;
 }
 
@@ -1987,6 +2141,23 @@ int cmd_update(const std::string& target, bool yes, EventStream& stream) {
     if (!rebuildResult) {
         log::error("failed to rebuild catalog: {}", rebuildResult.error());
         return 1;
+    }
+
+    // The synced index moves; the local overlay does not move with it. A
+    // recipe added by hand can quietly become a byte-identical shadow of
+    // what the index now ships -- see cmd_add_xpkg's refusal for the same
+    // check at add time. `update` is the moment to notice it's happened
+    // since, and clean it up rather than let it accumulate.
+    auto gone = overlay::gc_identical(overlay::dir());
+    if (!gone.empty()) {
+        std::string joined;
+        for (auto& name : gone) {
+            if (!joined.empty()) joined += ", ";
+            joined += name;
+        }
+        log::println("{} local recipe(s) identical to the synced index were "
+                     "removed: {}", gone.size(), joined);
+        catalog.rebuild(true);
     }
 
     log::println("index updated");

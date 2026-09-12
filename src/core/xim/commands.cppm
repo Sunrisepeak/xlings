@@ -165,6 +165,19 @@ int cmd_info(const std::string& target, EventStream& stream,
 // === add-xpkg command ===
 int cmd_add_xpkg(const std::string& fileOrUrl, EventStream& stream);
 
+// === local overlay: list / remove / clear ===
+//
+// The overlay `--add-xpkg` writes into has no attribution and no way to
+// clean it up. These three verbs are that: `--list-xpkg` shows what is
+// there and its relationship to the synced index (see
+// xlings.core.xim.overlay::Status), `--remove-xpkg` deletes one entry,
+// `--clear-xpkg` deletes a whole category ("all" or "stale" — Identical
+// plus Behind, the ones the synced index has already caught up with or
+// moved past).
+int cmd_list_xpkg();
+int cmd_remove_xpkg(const std::string& name);
+int cmd_clear_xpkg(const std::string& what);
+
 // === update command ===
 //
 // Flow:
