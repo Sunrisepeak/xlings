@@ -187,6 +187,14 @@ std::vector<DiscoveredEntry> load_with_files(const fs::path& dir) {
     return out;
 }
 
+std::optional<DiscoveredEntry> find_entry(
+        std::span<const DiscoveredEntry> discovered, std::string_view name) {
+    for (auto& item : discovered) {
+        if (item.entry.name == name) return item;
+    }
+    return std::nullopt;
+}
+
 bool remove_recipe_file(const fs::path& recipeFile) {
     std::error_code ec;
     bool removed = fs::remove(recipeFile, ec);
@@ -217,6 +225,17 @@ upstream_candidates(std::string_view name) {
 Status status_of(const Entry& entry, const fs::path& localFile,
                  std::span<const std::pair<std::string, fs::path>> candidates) {
     Status status;
+
+    // A tracked entry whose file is gone: nothing below this line is
+    // meaningful (an empty sha reads as "no bytes to compare", not "no
+    // file"), and left unchecked this used to degrade all the way to
+    // Unique -- a tracked, deleted recipe reported as fine.
+    std::error_code ec;
+    if (!fs::is_regular_file(localFile, ec)) {
+        status.kind = Status::Missing;
+        return status;
+    }
+
     auto localSha = file_sha256(localFile);
 
     // 1. Byte-identical to any candidate wins outright — the recipe is
@@ -277,7 +296,12 @@ std::vector<std::string> gc_identical(const fs::path& dir, std::span<const RepoD
     for (auto& item : discovered) {
         auto candidates = upstream_candidates(item.entry.name, repos);
         auto status = status_of(item.entry, item.path, candidates);
-        if (status.kind == Status::Identical) {
+        // Missing can only ever be a TRACKED entry (see `Status::Kind`), so
+        // it is provenance garbage of a different shape than Identical: no
+        // file to delete, just a `.overlay.json` record with nothing left
+        // to back it. `remove_recipe_file` on an already-gone file is a
+        // documented no-op, so folding it into the same branch is safe.
+        if (status.kind == Status::Identical || status.kind == Status::Missing) {
             remove_recipe_file(item.path);
             removed.push_back(item.entry.name);
         }
