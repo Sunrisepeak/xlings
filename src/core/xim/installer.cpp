@@ -754,27 +754,18 @@ namespace detail_ {
 
 // Recover `<dataDir>/xpkgs/<store>/<version>` from a version record's
 // (already-expanded) `path`, when there is no recipe left to re-derive it
-// from `PackageMatch`. Same "first two components after xpkgs/" cut as
-// `profile.cpp`'s `collect_subos_references_` -- the store dirname carries
-// the identity, and everything past the version is a bindir that must be
-// discarded, not walked into.
+// from `PackageMatch`. One parser for store paths: `coordinate_from_payload_path`
+// (xvm/owner.cpp) already does the right-to-left "two components after the
+// LAST xpkgs" walk and is used by five other files; this just re-encodes its
+// answer back into a directory with the same `-x-` join `package_store_name`
+// writes, rather than re-deriving the cut here a second time.
 std::optional<std::filesystem::path> store_version_dir_from_recorded_path_(
         const std::string& expandedPath,
         const std::filesystem::path& dataDir) {
-    auto pos = expandedPath.find("xpkgs/");
-    std::size_t skip = 6;
-    if (pos == std::string::npos) {
-        pos = expandedPath.find("xpkgs\\");
-        if (pos == std::string::npos) return std::nullopt;
-    }
-    auto rel = expandedPath.substr(pos + skip);
-    auto slash1 = rel.find_first_of("/\\");
-    if (slash1 == std::string::npos) return std::nullopt;
-    auto slash2 = rel.find_first_of("/\\", slash1 + 1);
-    auto storeAndVersion = (slash2 != std::string::npos)
-        ? rel.substr(0, slash2)
-        : rel;
-    return dataDir / "xpkgs" / storeAndVersion;
+    auto coord = xvm::coordinate_from_payload_path(expandedPath);
+    if (!coord) return std::nullopt;
+    return dataDir / "xpkgs" / package_store_name(coord->ns, coord->package)
+        / coord->version;
 }
 
 std::string format_hook_failure(

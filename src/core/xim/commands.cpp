@@ -1638,38 +1638,46 @@ int cmd_remove(const std::string& target, bool yes, EventStream& stream,
 
     int rc = 0;
     for (const auto& name : subosNames) {
-        const bool switchSubos = !name.empty();
-        std::string prevEnv;
-        std::string prevOverride;
-        if (switchSubos) {
-            // Both, and that is not belt-and-braces: the override is what
-            // recomputes Config's cached paths/workspace, and
-            // XLINGS_ACTIVE_SUBOS is what the activation path re-reads for
-            // itself. Same pairing subos.cpp uses for the same reason.
-            prevEnv = utils::get_env_or_default("XLINGS_ACTIVE_SUBOS");
-            platform::set_env_variable("XLINGS_ACTIVE_SUBOS", name);
-            prevOverride = Config::set_active_subos_override(name);
-            // set_active_subos_override's own reload reads the OLD
-            // paths_.activeSubos (it updates the workspace before it
-            // recomputes which subos that even means), so the workspace it
-            // just loaded is still the PREVIOUS subos's, not `name`'s.
-            // subos.cpp's own uses of this override never notice, because
-            // they hand off to cmd_install, which reloads again on its own
-            // -- by which point paths_.activeSubos has already caught up
-            // and that second reload gets it right. `remove` does not call
-            // into another command that reloads for it, so it has to ask
-            // for that second reload itself.
-            Config::reload_state();
-        }
+        ScopedSubosOverride scope(name);
         int one = cmd_remove_in_scope_(target, yes, stream, force, all, catalog);
         if (one != 0) rc = one;
-        if (switchSubos) {
-            (void)Config::set_active_subos_override(prevOverride);
-            Config::reload_state();
-            platform::set_env_variable("XLINGS_ACTIVE_SUBOS", prevEnv);
-        }
     }
     return rc;
+}
+
+ScopedSubosOverride::ScopedSubosOverride(std::string name)
+        : active_(!name.empty()) {
+    if (!active_) return;
+    // Both, and that is not belt-and-braces: the override is what
+    // recomputes Config's cached paths/workspace, and XLINGS_ACTIVE_SUBOS is
+    // what the activation path re-reads for itself. Same pairing subos.cpp
+    // uses for the same reason.
+    prevEnv_ = utils::get_env_or_default("XLINGS_ACTIVE_SUBOS");
+    platform::set_env_variable("XLINGS_ACTIVE_SUBOS", name);
+    prevOverride_ = Config::set_active_subos_override(std::move(name));
+    // set_active_subos_override's own reload reads the OLD paths_.activeSubos
+    // (it updates the workspace before it recomputes which subos that even
+    // means), so the workspace it just loaded is still the PREVIOUS subos's,
+    // not the new one's. subos.cpp's own uses of this override never notice,
+    // because they hand off to cmd_install, which reloads again on its own --
+    // by which point paths_.activeSubos has already caught up and that second
+    // reload gets it right. This guard does not call into another command
+    // that reloads for it, so it asks for that second reload itself.
+    Config::reload_state();
+}
+
+ScopedSubosOverride::~ScopedSubosOverride() {
+    if (!active_) return;
+    // Mirror the ENTRY order, not its reverse: the env var goes back first.
+    // `set_active_subos_override(prevOverride_)` falls through to reading
+    // XLINGS_ACTIVE_SUBOS whenever prevOverride_ is empty (the common case --
+    // there was no override before this guard), so that read has to already
+    // see the restored value. Restoring the override first would resolve
+    // against the env var THIS GUARD is still holding, landing back on the
+    // subos being left instead of the one being returned to.
+    platform::set_env_variable("XLINGS_ACTIVE_SUBOS", prevEnv_);
+    (void)Config::set_active_subos_override(prevOverride_);
+    Config::reload_state();
 }
 
 int cmd_search(const std::string& keyword, EventStream& stream) {

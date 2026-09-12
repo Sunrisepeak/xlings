@@ -164,6 +164,38 @@ selected_payloadless_config_has_uninstall_(
         const PackageMatch& match,
         std::string_view platform);
 
+// RAII guard for acting on a named subos for a scoped stretch of code, then
+// restoring both halves of "which subos is current": the XLINGS_ACTIVE_SUBOS
+// env var (what a spawned or re-entered activation path re-reads) and
+// Config's active-subos override (what Config's own cached paths/workspace
+// are derived from).
+//
+// `name.empty()` is a no-op guard -- "stay on the current subos", the common
+// case -- so a caller never needs its own branch for "did I actually switch".
+//
+// Exit restores in the SAME relative order as entry (env var, override, one
+// reload), not the reverse: `Config::set_active_subos_override("")` falls
+// through to reading XLINGS_ACTIVE_SUBOS whenever the restored override is
+// empty, so the env var has to already be back to its previous value BEFORE
+// the override is restored -- restoring the override first would resolve
+// against the env var this guard just switched, landing on the subos being
+// LEFT rather than the one being returned to. The extra explicit
+// `Config::reload_state()` on each end compensates for
+// `set_active_subos_override`'s own reload reading `paths_.activeSubos`
+// before recomputing it, which would otherwise use the state from one
+// transition ago.
+struct ScopedSubosOverride {
+    explicit ScopedSubosOverride(std::string name);
+    ~ScopedSubosOverride();
+    ScopedSubosOverride(const ScopedSubosOverride&) = delete;
+    ScopedSubosOverride& operator=(const ScopedSubosOverride&) = delete;
+
+private:
+    bool active_;
+    std::string prevEnv_;
+    std::string prevOverride_;
+};
+
 int cmd_remove(const std::string& target, bool yes, EventStream& stream,
                bool force, bool all, std::optional<std::string> subosScope);
 

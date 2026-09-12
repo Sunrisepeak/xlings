@@ -67,7 +67,18 @@ RepairResult repair_one(const RepairTask& task, const RepairPolicy& policy, cons
 
     const auto install = std::format("{} install {} -y",
                                      policy.client, coordinate);
-    const auto remove  = std::format("{} remove {} -y",
+    // --force: this remove is a MEANS to a reinstall, not the user's own
+    // request to remove something. Without it, a recipe whose uninstall()
+    // hook throws exits 1 -- but 2026.9.12's `remove` withdraws the version
+    // DB entry, workspace binding and shim BEFORE running that hook, so the
+    // record is already gone by the time the exit code says "failed". Read
+    // literally, that exit code used to mean "could not be removed" and this
+    // rung returned early: a false report, and the reinstall that should
+    // have followed never ran. `--force` also makes the exit code itself
+    // mostly moot for R3's purposes -- a hook failure now exits 0 under
+    // force -- but the exit code is no longer trusted for control flow
+    // either way; see below.
+    const auto remove  = std::format("{} remove {} --force -y",
                                      policy.client, coordinate);
 
     // R2
@@ -83,15 +94,18 @@ RepairResult repair_one(const RepairTask& task, const RepairPolicy& policy, cons
                 "re-register failed, and the package is not available from "
                 "the index — removing it could not be undone"};
     }
-    if (run(remove) != 0) {
-        return {false, "none",
-                "re-register failed and the entry could not be removed"};
-    }
-    // The command exited 0. Two independent questions follow, and the order
-    // they are asked in is the whole safety property.
+    // Exit code intentionally not checked. `remove`'s exit code answers "did
+    // everything about this removal go perfectly" (hook included), not "is
+    // the record still there" -- and those are different questions even
+    // under `--force`. What decides whether R3 proceeds and what it reports
+    // is entirely below: run the install regardless, then ask the verifier.
+    run(remove);
+    // Two independent questions follow, and the order they are asked in is
+    // the whole safety property.
     //
-    // WHETHER the install runs must not depend on the verifier. It used to,
-    // and returning early on "the records survived" performed the destructive
+    // WHETHER the install runs must not depend on the verifier (nor, now,
+    // on remove's exit code). It used to depend on the verifier, and
+    // returning early on "the records survived" performed the destructive
     // half of remove-and-reinstall while skipping the half that puts it back.
     // Measured on a real home, that uninstalled a working `musl-gcc`: its
     // recipe names targets the release does not own, those are skipped, the
@@ -113,13 +127,14 @@ RepairResult repair_one(const RepairTask& task, const RepairPolicy& policy, cons
     if (recordsSurvived) {
         return {false, installed ? "reinstall" : "none",
                 std::format(
-                    "`remove` exited 0 without dropping {} — it is still "
-                    "registered{}. Removal exits 0 when it only detaches this "
-                    "subos (another subos still references the version), when "
-                    "the recipe names targets the release does not own, and "
-                    "when the payload is already gone; none of those clears "
-                    "the record this repair needs cleared. Take it out where "
-                    "it lives (`xlings subos use <name>` then `xlings remove "
+                    "`remove --force` did not drop {} — it is still "
+                    "registered{}. Removal is a no-op on the record when it "
+                    "only detaches this subos (another subos still "
+                    "references the version), when the recipe names targets "
+                    "the release does not own, and when the payload is "
+                    "already gone; none of those clears the record this "
+                    "repair needs cleared. Take it out where it lives "
+                    "(`xlings subos use <name>` then `xlings remove "
                     "{}`) and rerun",
                     coordinate,
                     installed ? ", and the reinstall that followed did not "
