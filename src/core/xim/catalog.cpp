@@ -4,6 +4,7 @@ import std;
 import mcpplibs.xpkg;
 import xlings.core.config;
 import xlings.core.log;
+import xlings.core.notice;
 import xlings.core.xim.payload;
 import xlings.core.xim.index;
 import xlings.core.xim.repo;
@@ -179,13 +180,15 @@ NamespaceRankResult_ prefer_namespace_rank_(
         if (namespace_rank_(match.namespaceName) == best) {
             out.kept.push_back(match);
         } else {
-            // Same rule as announce_demotion_: no version, no `@`. This string
-            // is printed as a command the user can copy, and
-            // `xlings install local:binutils@` is not one.
-            out.demoted.push_back(
-                match.version.empty()
+            // Same rule as demotion_notice: no version, no `@`. `coordinate`
+            // is printed as a command the user can copy, and `xlings install
+            // local:binutils@` is not one.
+            out.demoted.push_back({
+                .coordinate = match.version.empty()
                     ? match.canonicalName
-                    : std::format("{}@{}", match.canonicalName, match.version));
+                    : std::format("{}@{}", match.canonicalName, match.version),
+                .version = match.version,
+            });
         }
     }
     return out;
@@ -540,16 +543,27 @@ std::vector<PackageMatch> PackageCatalog::prefer_project_scope_(std::vector<Pack
     return detail_::prefer_project_scope_(std::move(matches));
 }
 
-void PackageCatalog::announce_demotion_(const std::string& target,
-                            const PackageMatch& chosen) const {
-    if (chosen.demoted.empty()) return;
+namespace detail_ {
+
+bool demotion_notice(const std::string& target, const PackageMatch& chosen,
+                     const notice::Memo& memo) {
+    if (chosen.demoted.empty()) return false;
+
+    // A `local:` copy at the exact version the index already has is not a
+    // conflict -- it is the common case on a dev machine, and announcing it
+    // on every command would be exactly the noise this rule exists to
+    // remove. Only a REAL alternative (a different version) is worth a
+    // word.
+    const bool allDuplicates = std::ranges::all_of(
+        chosen.demoted,
+        [&](const auto& d) { return d.version == chosen.version; });
+    if (allDuplicates) return false;
+
     std::string losers;
-    for (const auto& name : chosen.demoted) {
+    for (const auto& d : chosen.demoted) {
         if (!losers.empty()) losers += ", ";
-        losers += name;
+        losers += d.coordinate;
     }
-    auto key = target + "\x1f" + chosen.canonicalName + "\x1f" + losers;
-    if (!demotionsAnnounced_.insert(key).second) return;
     // `@version` only when there IS one. The identity-only path
     // (resolve_local_identity, used by inventory) does not select a
     // version, so unconditional formatting printed `local:binutils@` --
@@ -561,12 +575,47 @@ void PackageCatalog::announce_demotion_(const std::string& target,
                                 const std::string& version) {
         return version.empty() ? name : name + "@" + version;
     };
-    log::warn("'{}' also provided by {}; selected {} by namespace "
-              "priority (local ranks last)",
-              target, losers,
-              withVersion(chosen.canonicalName, chosen.version));
-    log::warn("  to pick the other: use its full name, e.g. `{}`",
-              chosen.demoted.front());
+    const auto fingerprint = target + "\x1f" + chosen.canonicalName + "\x1f" + losers;
+    return notice::notice_once(memo, "catalog.demoted", fingerprint, {
+        .code    = "xim.namespace_priority",
+        .summary = std::format(
+            "'{}' also provided by {}; selected {} by namespace "
+            "priority (local ranks last)",
+            target, losers,
+            withVersion(chosen.canonicalName, chosen.version)),
+        .actions = { { "pick the other",
+                      std::format("xlings install {}",
+                                  chosen.demoted.front().coordinate) } },
+    });
+}
+
+}  // namespace detail_
+
+void PackageCatalog::announce_demotion_(const std::string& target,
+                            const PackageMatch& chosen) const {
+    if (chosen.demoted.empty()) return;
+    // A pure duplicate (every demoted candidate is the version already
+    // chosen) is not a conflict and gets neither a word nor a memory of one
+    // -- checked here too, before the process-level key is even built, not
+    // just inside demotion_notice.
+    if (std::ranges::all_of(chosen.demoted, [&](const auto& d) {
+            return d.version == chosen.version;
+        })) {
+        return;
+    }
+    std::string losers;
+    for (const auto& d : chosen.demoted) {
+        if (!losers.empty()) losers += ", ";
+        losers += d.coordinate;
+    }
+    auto key = target + "\x1f" + chosen.canonicalName + "\x1f" + losers;
+    // Fast in-process gate before the persisted one: `resolve_target` has
+    // sixteen callers and several resolve the same target twice in one run
+    // (planner, then installer) -- this skips the home-config read
+    // `notice::notice_once`'s Memo does for what is, within one process,
+    // obviously the same announcement.
+    if (!demotionsAnnounced_.insert(key).second) return;
+    detail_::demotion_notice(target, chosen, notice::config_memo());
 }
 
 namespace detail_ {

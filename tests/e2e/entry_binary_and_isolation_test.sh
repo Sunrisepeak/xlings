@@ -47,15 +47,16 @@ LOC_INDEX_DIR="$RUNTIME_DIR/local-index"
 mkdir -p "$HOME_DIR/subos/default/bin" \
          "$XIM_INDEX_DIR/pkgs/d" "$LOC_INDEX_DIR/pkgs/d"
 
-# Two recipes for one bare name, in two namespaces. `demoted` is a payloadless
-# config package on both sides: this test is about NAME RESOLUTION, and giving
-# it a download would make a network failure look like a resolution failure.
+# Two recipes for one bare name, in two namespaces. `demoted`/`twinned` are
+# payloadless config packages on both sides: this test is about NAME
+# RESOLUTION, and giving them a download would make a network failure look
+# like a resolution failure.
 mk_recipe() {
-    local file="$1" ns="$2" ver="$3"
+    local file="$1" name="$2" ns="$3" ver="$4"
     cat > "$file" <<LUA
 package = {
     spec = "1",
-    name = "demoted",
+    name = "$name",
     description = "resolution fixture from $ns",
     type = "config",
     archs = {"x86_64", "aarch64"},
@@ -69,8 +70,13 @@ function config() return true end
 function uninstall() return true end
 LUA
 }
-mk_recipe "$XIM_INDEX_DIR/pkgs/d/demoted.lua" xim 2.0.0
-mk_recipe "$LOC_INDEX_DIR/pkgs/d/demoted.lua" local 1.0.0
+mk_recipe "$XIM_INDEX_DIR/pkgs/d/demoted.lua" demoted xim 2.0.0
+mk_recipe "$LOC_INDEX_DIR/pkgs/d/demoted.lua" demoted local 1.0.0
+# S1c fixture: identical version in both namespaces. `local` still loses the
+# bare-name tiebreak -- the rule has no exception for "tied" -- but a
+# duplicate of the exact build already chosen is not a conflict worth a word.
+mk_recipe "$XIM_INDEX_DIR/pkgs/d/twinned.lua" twinned xim 1.0.0
+mk_recipe "$LOC_INDEX_DIR/pkgs/d/twinned.lua" twinned local 1.0.0
 for d in "$XIM_INDEX_DIR" "$LOC_INDEX_DIR"; do
     (cd "$d" && git init -q && git add -A && git commit -q -m init)
 done
@@ -97,7 +103,7 @@ run_x() {
 }
 run_x update >/dev/null 2>&1 || true
 
-echo "== S1: a bare name both namespaces provide resolves, and names the loser =="
+echo "== S1: a bare name both namespaces provide resolves, and names the loser, once =="
 out="$(run_x info demoted 2>&1 || true)"
 if ! grep -q "xim:demoted" <<<"$out"; then
     echo "$out"
@@ -114,6 +120,37 @@ if ! grep -q "local:demoted" <<<"$out"; then
     fail "S1: the losing candidate was not named"
 fi
 echo "   ok — resolved to xim:, and said what it beat"
+
+# A REAL conflict (different versions) is said once per home, not once per
+# command. The first process persists that it said this; the second process
+# reads that back and says nothing, even though nothing else about the home
+# changed.
+out2="$(run_x info demoted 2>&1 || true)"
+if grep -qi "namespace priority" <<<"$out2"; then
+    echo "$out2"
+    fail "S1: a repeat command re-announced a conflict this home already saw"
+fi
+echo "   ok — the second run stayed quiet about the same conflict"
+
+echo "== S1c: a duplicate local copy at the SAME version is never a conflict =="
+# `local:twinned@1.0.0` loses the bare-name tiebreak the same as any `local:`
+# candidate -- but it is the identical build the index already has, so there
+# is nothing to pick between and neither run should say anything about it.
+out="$(run_x info twinned 2>&1 || true)"
+if ! grep -q "xim:twinned" <<<"$out"; then
+    echo "$out"
+    fail "S1c: the bare name did not resolve to the non-local namespace"
+fi
+if grep -qi "namespace priority" <<<"$out"; then
+    echo "$out"
+    fail "S1c: a duplicate of the chosen version was announced as a conflict"
+fi
+out2="$(run_x info twinned 2>&1 || true)"
+if grep -qi "namespace priority" <<<"$out2"; then
+    echo "$out2"
+    fail "S1c: the second run announced a duplicate too"
+fi
+echo "   ok — neither run mentioned namespace priority"
 
 echo "== S2: an explicitly qualified local target is not overruled =="
 out="$(run_x info local:demoted 2>&1 || true)"

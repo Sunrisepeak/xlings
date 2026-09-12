@@ -39,6 +39,7 @@ import xlings.core.xvm.switch_plan;
 import xlings.core.xvm.shim;
 import xlings.core.xvm.commands;
 import xlings.core.compact;
+import xlings.core.notice;
 import xlings.core.config;
 import xlings.core.home_config;
 import xlings.platform;
@@ -858,7 +859,8 @@ TEST(XimNamespacePriorityTest, LocalLosesABareNameAndIsNamed) {
     // The demotion is DATA, not just a log line: a pick nobody can see is the
     // thing this rule must not become.
     ASSERT_EQ(got->demoted.size(), 1u);
-    EXPECT_EQ(got->demoted.front(), "local:xlings@0.4.51");
+    EXPECT_EQ(got->demoted.front().coordinate, "local:xlings@0.4.51");
+    EXPECT_EQ(got->demoted.front().version, "0.4.51");
 }
 
 TEST(XimNamespacePriorityTest, AnExplicitlyQualifiedLocalTargetIsUntouched) {
@@ -904,4 +906,66 @@ TEST(XimNamespacePriorityTest, LocalAloneStillResolves) {
     ASSERT_TRUE(got.has_value()) << got.error();
     EXPECT_EQ(got->canonicalName, "local:mytool");
     EXPECT_TRUE(got->demoted.empty());
+}
+
+// ── demotion notice: a pure duplicate is not a conflict ───────────────────
+//
+// `local:xlings@0.4.51` sitting next to `xim:xlings@0.4.51` is the ordinary
+// shape of a dev machine, not a namespace conflict: the version is
+// identical, so there is nothing to pick between. `detail_::demotion_notice`
+// is the free function behind `announce_demotion_`'s decision, with an
+// injected `notice::Memo` so it is testable without a home -- see
+// tests/unit/test_notice.cpp for the same shape of fake.
+
+namespace {
+
+struct CountingMemo {
+    int markCalls = 0;
+    std::set<std::string, std::less<>> seenKeys;
+
+    xlings::notice::Memo memo() {
+        return xlings::notice::Memo{
+            .seen = [this](std::string_view id) { return seenKeys.contains(id); },
+            .mark = [this](std::string_view id) {
+                ++markCalls;
+                seenKeys.emplace(id);
+            },
+        };
+    }
+};
+
+}  // namespace
+
+TEST(XimDemotionNotice, DuplicateLocalCopyIsSilent) {
+    xlings::xim::PackageMatch chosen;
+    chosen.canonicalName = "xim:xlings";
+    chosen.version = "0.4.51";
+    chosen.demoted = { { "local:xlings@0.4.51", "0.4.51" } };
+
+    CountingMemo counting;
+    auto memo = counting.memo();
+
+    EXPECT_FALSE(xlings::xim::detail_::demotion_notice("xlings", chosen, memo))
+        << "same version as the one chosen: nothing to report";
+    EXPECT_EQ(counting.markCalls, 0)
+        << "a pure duplicate must not even be remembered as announced";
+}
+
+TEST(XimDemotionNotice, BehindLocalCopyNotesOnce) {
+    xlings::xim::PackageMatch chosen;
+    chosen.canonicalName = "xim:xlings";
+    chosen.version = "2026.8.11.1";
+    chosen.demoted = { { "local:xlings@0.4.51", "0.4.51" } };
+
+    CountingMemo counting;
+    auto memo = counting.memo();
+
+    EXPECT_TRUE(xlings::xim::detail_::demotion_notice("xlings", chosen, memo))
+        << "a real alternative (different version) is worth a word";
+    EXPECT_EQ(counting.markCalls, 1);
+
+    // Same target, same chosen, same losers -- the Memo already has this
+    // fingerprint, so the second call must say nothing.
+    EXPECT_FALSE(xlings::xim::detail_::demotion_notice("xlings", chosen, memo));
+    EXPECT_EQ(counting.markCalls, 1);
 }
