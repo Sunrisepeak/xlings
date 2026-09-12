@@ -1636,7 +1636,10 @@ int dispatch_(int argc, char* argv[]) {
         .subcommand("remove")
             .description("Remove a package")
             .option(cmdline::Option("global").short_name('g').help("Act on the global scope (not the project-local subos)"))
-            .option(cmdline::Option("force").help("Remove even if installed packages depend on it"))
+            .option(cmdline::Option("force").help("Remove even if packages depend on it, the recipe is gone, or its uninstall hook fails"))
+            .option(cmdline::Option("all").help("Remove every installed version, not just the active one"))
+            .option(cmdline::Option("all-subos").help("Remove from every subos that has it installed"))
+            .option(cmdline::Option("subos").takes_value().value_name("NAME").help("Act on this subos only, instead of the current one"))
             .arg("package").required().help("Package to remove (name or name@ver)")
             .arg("version").help("Optional version (alternative to name@ver form)")
             .action(wrap_rc([&stream](const cmdline::ParsedArgs& args) -> int {
@@ -1652,7 +1655,18 @@ int dispatch_(int argc, char* argv[]) {
                 // link is a different decision and a scripted `remove -y`
                 // should still be stopped by it.
                 bool force = args.is_flag_set("force");
-                return xim::cmd_remove(target, yes, stream, force);
+                bool all = args.is_flag_set("all");
+                // --subos names one subos directly; --all-subos means every
+                // subos that references the target ("*"); neither means "act
+                // on the current subos" (nullopt), the pre-existing default.
+                // --subos wins if both are somehow given.
+                std::optional<std::string> subosScope;
+                if (auto named = args.value("subos")) {
+                    subosScope = *named;
+                } else if (args.is_flag_set("all-subos")) {
+                    subosScope = "*";
+                }
+                return xim::cmd_remove(target, yes, stream, force, all, subosScope);
             }))
 
         // update

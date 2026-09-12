@@ -537,6 +537,19 @@ public:
         bool        detachedOnly { false };
         std::string target;   // resolved name, as stored in the version DB
         std::string version;  // resolved version, as stored (may be namespaced)
+
+        // Non-empty when the recipe's uninstall() ran and threw. The
+        // withdrawal (version DB entry, workspace binding, shim, payload)
+        // still happened -- this is a report, not a rollback signal. The
+        // caller decides what "still not clean enough" means: `--force`
+        // accepts it, an interactive `remove` without it does not.
+        std::string hookFailure;
+        // True when no index could resolve this package's recipe at all
+        // (deleted upstream, index dropped, ...), so no hook ran and the
+        // default removal op was synthesised directly from the version
+        // record instead. Distinct from hookFailure: here there was nothing
+        // to even attempt.
+        bool recipeUnavailable { false };
     };
 
     // Uninstall a package

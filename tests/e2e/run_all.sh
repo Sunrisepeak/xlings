@@ -183,6 +183,10 @@ TESTS=(
     # against 2026.9.4.1, where one --fix deleted 1173 sysroot links and
     # dropped 367 registrations with every payload present on disk.
     "E2E-99 |doctor_relocated_home_test.sh||"
+    # remove resolves against what is installed, withdraws state before the
+    # recipe's uninstall() runs, and --force/--all/--all-subos make "removed"
+    # mean removed no matter what shape the home is in (2026.9.12 Task 5).
+    "E2E-102|remove_force_contract_test.sh||"
 )
 
 # ── orphan check: a test that runs NOWHERE looks exactly like one that passes ──

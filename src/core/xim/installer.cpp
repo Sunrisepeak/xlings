@@ -752,6 +752,31 @@ bool evict_invalid_archive_cache_(
 
 namespace detail_ {
 
+// Recover `<dataDir>/xpkgs/<store>/<version>` from a version record's
+// (already-expanded) `path`, when there is no recipe left to re-derive it
+// from `PackageMatch`. Same "first two components after xpkgs/" cut as
+// `profile.cpp`'s `collect_subos_references_` -- the store dirname carries
+// the identity, and everything past the version is a bindir that must be
+// discarded, not walked into.
+std::optional<std::filesystem::path> store_version_dir_from_recorded_path_(
+        const std::string& expandedPath,
+        const std::filesystem::path& dataDir) {
+    auto pos = expandedPath.find("xpkgs/");
+    std::size_t skip = 6;
+    if (pos == std::string::npos) {
+        pos = expandedPath.find("xpkgs\\");
+        if (pos == std::string::npos) return std::nullopt;
+    }
+    auto rel = expandedPath.substr(pos + skip);
+    auto slash1 = rel.find_first_of("/\\");
+    if (slash1 == std::string::npos) return std::nullopt;
+    auto slash2 = rel.find_first_of("/\\", slash1 + 1);
+    auto storeAndVersion = (slash2 != std::string::npos)
+        ? rel.substr(0, slash2)
+        : rel;
+    return dataDir / "xpkgs" / storeAndVersion;
+}
+
 std::string format_hook_failure(
         std::string_view hookName,
         const mcpplibs::xpkg::HookResult& result) {
@@ -3252,15 +3277,74 @@ std::expected<Installer::UninstallOutcome, std::string> Installer::uninstall(con
     std::filesystem::path pkgFile;
     std::filesystem::path installDir;
     std::optional<PackageMatch> resolvedMatch;
+    // True when no index could resolve a recipe at all -- the version
+    // record and its payload are the only evidence left, and removal has
+    // to work from those instead of refusing (openxlings/xlings#578 and the
+    // maintainer's "remove --all --force must always work").
+    bool recipeUnavailable = false;
+    // The record's OWN provider/providerVersion (its bindingGroup, when it
+    // has one) -- read here because there is no PackageMatch to derive it
+    // from below. A record installed through a namespaced index writes a
+    // provider like "xim:plain", not the bare target name; presenting the
+    // bare name as the executing provider to snapshot_xpkg_removal_context
+    // reads as a DIFFERENT provider trying to remove someone else's version
+    // ("selected version is owned by provider 'xim:plain', not 'plain'").
+    std::string recipeUnavailableProvider;
+    std::string recipeUnavailableProviderVersion;
 
     if (catalog_) {
         auto match = catalog_->resolve_target(resolvedTarget, platform);
-        if (!match) return std::unexpected(match.error());
-        resolvedMatch = *match;
-        pkgFile = match->pkgFile;
-        installDir = (match->storeRoot.empty() ? (Config::paths().dataDir / "xpkgs") : match->storeRoot)
-            / detail_::effective_store_name_(*match)
-            / match->version;
+        if (match) {
+            resolvedMatch = *match;
+            pkgFile = match->pkgFile;
+            installDir = (match->storeRoot.empty() ? (Config::paths().dataDir / "xpkgs") : match->storeRoot)
+                / detail_::effective_store_name_(*match)
+                / match->version;
+        } else {
+            // The recipe is gone from every index the catalog knows about --
+            // deleted upstream, an index repo pointed elsewhere, whatever.
+            // The version record and the payload it names both outlive the
+            // recipe that wrote them. Read the identity from what the
+            // installer already wrote instead of asking a recipe that is no
+            // longer there to re-derive it.
+            const auto& db = Config::versions_mut();
+            const auto* vinfo = xvm::get_vinfo(db, targetName);
+            std::string dbVersion = requestedVersion;
+            if (dbVersion.empty() && vinfo && vinfo->versions.size() == 1) {
+                // Only when unambiguous. A caller with several versions and
+                // no version pinned has to say which one; cmd_remove is
+                // where that ambiguity gets surfaced to the user.
+                dbVersion = vinfo->versions.begin()->first;
+            }
+            const xvm::VData* vdata = (vinfo && !dbVersion.empty())
+                ? xvm::get_vdata(db, targetName, dbVersion)
+                : nullptr;
+            std::optional<std::filesystem::path> derivedInstallDir;
+            if (vdata) {
+                derivedInstallDir = detail_::store_version_dir_from_recorded_path_(
+                    xvm::expand_path(vdata->path, Config::paths().homeDir.string()),
+                    Config::paths().dataDir);
+            }
+            if (!derivedInstallDir) {
+                // Genuinely nothing to go on: no recipe, no record. The
+                // catalog's own "not found" is still the right message.
+                return std::unexpected(match.error());
+            }
+            recipeUnavailable = true;
+            requestedVersion  = dbVersion;
+            installDir        = *derivedInstallDir;
+            if (vdata->bindingGroup) {
+                recipeUnavailableProvider = vdata->bindingGroup->provider;
+                recipeUnavailableProviderVersion =
+                    vdata->bindingGroup->providerVersion;
+            }
+            if (recipeUnavailableProvider.empty()) {
+                recipeUnavailableProvider = targetName;
+            }
+            if (recipeUnavailableProviderVersion.empty()) {
+                recipeUnavailableProviderVersion = dbVersion;
+            }
+        }
     } else {
         auto* entry = index_->find_entry(name);
         if (!entry) {
@@ -3277,7 +3361,7 @@ std::expected<Installer::UninstallOutcome, std::string> Installer::uninstall(con
                 resolvedMatch->namespaceName,
                 resolvedMatch->name)
             : resolvedMatch->canonicalName)
-        : targetName;
+        : (recipeUnavailable ? recipeUnavailableProvider : targetName);
     auto detachVersion = resolvedMatch ? resolvedMatch->version : requestedVersion;
     if (resolvedMatch) {
         // The spelling the records were WRITTEN with, not the one today's
@@ -3297,7 +3381,8 @@ std::expected<Installer::UninstallOutcome, std::string> Installer::uninstall(con
     }
     auto executingProviderVersion = resolvedMatch
         ? resolvedMatch->version
-        : xvm::strip_namespace(detachVersion);
+        : (recipeUnavailable ? recipeUnavailableProviderVersion
+                             : xvm::strip_namespace(detachVersion));
 
     auto removalSnapshot = snapshot_xpkg_removal_context(
         Config::versions_mut(), Config::workspace(), {},
@@ -3370,67 +3455,91 @@ std::expected<Installer::UninstallOutcome, std::string> Installer::uninstall(con
         };
     }
 
-    auto executorPkgFile = detail_::uninstall_xpkg_file_(pkgFile, installDir);
-    if (executorPkgFile != pkgFile) {
-        log::debug("using xpkg snapshot for uninstall: {}", executorPkgFile.string());
-    }
-
-    auto execResult = mcpplibs::xpkg::create_executor(executorPkgFile);
-    if (!execResult) {
-        return std::unexpected(execResult.error());
-    }
-
-    auto& executor = *execResult;
-    executor.set_log_level(std::string(log::level_string()));
-
     mcpplibs::xpkg::ExecutionContext ctx;
-    ctx.pkg_name = resolvedMatch ? resolvedMatch->name : name;
-    ctx.version = resolvedMatch ? resolvedMatch->version : std::string{};
     ctx.platform = platform;
+    // Independent of whether a recipe was found: this is purely
+    // Config::xvm_artifact_subos_dir(), and the cleanup passes below (shim
+    // sync, subos env section, headers) need it regardless of the recipe.
     const auto artifactSubosDir =
-        detail_::configure_xpkg_execution_artifact_paths_(
-            ctx);
-    auto selectedStore = resolvedMatch
-        ? (resolvedMatch->storeRoot.empty()
-            ? Config::paths().dataDir / "xpkgs"
-            : resolvedMatch->storeRoot)
-        : Config::paths().dataDir / "xpkgs";
-    detail_::configure_dependency_store_roots_(ctx, selectedStore);
-    ctx.install_dir = installDir;
-    ctx.xpkg_dir = pkgFile.parent_path();
-    ctx.pkgindex_dir = detail_::pkgindex_root_for_(pkgFile);
+        detail_::configure_xpkg_execution_artifact_paths_(ctx);
 
-    bool useDefaultRemoval = false;
-    if (executor.has_hook(mcpplibs::xpkg::HookType::Uninstall)) {
-        log::debug("uninstalling {}...", name);
-        auto result = executor.run_hook(
-            mcpplibs::xpkg::HookType::Uninstall, ctx);
-        if (!result.success) {
-            return std::unexpected(
-                detail_::format_hook_failure("uninstall", result));
+    bool useDefaultRemoval = recipeUnavailable;
+    std::string hookFailure;
+    std::vector<mcpplibs::xpkg::XvmOp> xvm_ops;
+
+    if (!recipeUnavailable) {
+        auto executorPkgFile = detail_::uninstall_xpkg_file_(pkgFile, installDir);
+        if (executorPkgFile != pkgFile) {
+            log::debug("using xpkg snapshot for uninstall: {}", executorPkgFile.string());
         }
+
+        auto execResult = mcpplibs::xpkg::create_executor(executorPkgFile);
+        if (!execResult) {
+            return std::unexpected(execResult.error());
+        }
+
+        auto& executor = *execResult;
+        executor.set_log_level(std::string(log::level_string()));
+
+        ctx.pkg_name = resolvedMatch ? resolvedMatch->name : name;
+        ctx.version = resolvedMatch ? resolvedMatch->version : std::string{};
+        auto selectedStore = resolvedMatch
+            ? (resolvedMatch->storeRoot.empty()
+                ? Config::paths().dataDir / "xpkgs"
+                : resolvedMatch->storeRoot)
+            : Config::paths().dataDir / "xpkgs";
+        detail_::configure_dependency_store_roots_(ctx, selectedStore);
+        ctx.install_dir = installDir;
+        ctx.xpkg_dir = pkgFile.parent_path();
+        ctx.pkgindex_dir = detail_::pkgindex_root_for_(pkgFile);
+
+        if (executor.has_hook(mcpplibs::xpkg::HookType::Uninstall)) {
+            log::debug("uninstalling {}...", name);
+            auto result = executor.run_hook(
+                mcpplibs::xpkg::HookType::Uninstall, ctx);
+            if (!result.success) {
+                // The recipe's own cleanup failed. Before this change that
+                // was fatal HERE, before the version DB entry, the
+                // workspace binding, the shim or the payload had been
+                // touched -- a thrown uninstall() left the package
+                // registered as installed with no way to retry it (the
+                // next `install` sees the payload and skips straight past
+                // config()). Record the failure and keep going: withdrawal
+                // below runs regardless, and the caller (cmd_remove)
+                // decides whether "state withdrawn, hook unhappy" is enough
+                // to call this a success.
+                hookFailure = detail_::format_hook_failure("uninstall", result);
+                useDefaultRemoval = true;
+            }
+        } else {
+            // Check if this is a script-type or subos-type package and run default uninstall
+            bool isScriptType = false;
+            bool isSubosType  = false;
+            if (catalog_ && resolvedMatch) {
+                auto pkg = catalog_->load_package(*resolvedMatch);
+                if (pkg) {
+                    isScriptType = (pkg->type == mcpplibs::xpkg::PackageType::Script);
+                    isSubosType  = (pkg->type == mcpplibs::xpkg::PackageType::Subos);
+                }
+            } else if (index_) {
+                auto* entry = index_->find_entry(targetName);
+                if (entry) {
+                    isScriptType = (entry->type == mcpplibs::xpkg::PackageType::Script);
+                    isSubosType  = (entry->type == mcpplibs::xpkg::PackageType::Subos);
+                }
+            }
+            useDefaultRemoval = isScriptType || isSubosType;
+        }
+
+        xvm_ops = executor.xvm_operations();
     } else {
-        // Check if this is a script-type or subos-type package and run default uninstall
-        bool isScriptType = false;
-        bool isSubosType  = false;
-        if (catalog_ && resolvedMatch) {
-            auto pkg = catalog_->load_package(*resolvedMatch);
-            if (pkg) {
-                isScriptType = (pkg->type == mcpplibs::xpkg::PackageType::Script);
-                isSubosType  = (pkg->type == mcpplibs::xpkg::PackageType::Subos);
-            }
-        } else if (index_) {
-            auto* entry = index_->find_entry(targetName);
-            if (entry) {
-                isScriptType = (entry->type == mcpplibs::xpkg::PackageType::Script);
-                isSubosType  = (entry->type == mcpplibs::xpkg::PackageType::Subos);
-            }
-        }
-        useDefaultRemoval = isScriptType || isSubosType;
+        log::info("{}: no index provides its recipe anymore; withdrawing its "
+                  "registration and payload directly", detachTarget);
     }
 
-    // Process xvm operations collected by uninstall hook
-    auto xvm_ops = executor.xvm_operations();
+    // Process xvm operations collected by the uninstall hook, or synthesise
+    // the default removal op when there was no hook to ask (script/subos
+    // type, or no recipe at all), or the one there was threw.
     if (useDefaultRemoval) {
         xvm_ops.push_back({
             .op = "remove",
@@ -3617,9 +3726,11 @@ std::expected<Installer::UninstallOutcome, std::string> Installer::uninstall(con
 
     log::debug("{} uninstalled", resolvedTarget);
     return UninstallOutcome{
-        .detachedOnly = false,
-        .target       = detachTarget,
-        .version      = detachVersion,
+        .detachedOnly      = false,
+        .target            = detachTarget,
+        .version           = detachVersion,
+        .hookFailure       = hookFailure,
+        .recipeUnavailable = recipeUnavailable,
     };
 }
 

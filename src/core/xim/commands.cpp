@@ -47,6 +47,7 @@ import xlings.core.profile;
 import xlings.runtime.cancellation;
 import xlings.core.version_order;
 import xlings.core.xself.repair;
+import xlings.core.utils;
 
 namespace xlings::xim {
 
@@ -918,319 +919,26 @@ selected_payloadless_config_has_uninstall_(
     return executor->has_hook(xpkg::HookType::Uninstall);
 }
 
-int cmd_remove(const std::string& target, bool yes, EventStream& stream,
-               bool force) {
-    // Serialize against any other xlings mutating this home, then re-read
-    // state under the lock: Config loaded it at process start, outside the
-    // lock, so acting on that snapshot is how two commands lose each other's
-    // work. See xvm/lock.cppm.
-    auto stateLock = xvm::acquire_state_lock(Config::paths().homeDir);
-    if (!stateLock) {
-        log::error("{}", stateLock.error());
-        return 1;
-    }
-
-    // An emulated build installs emulated packages -- correctly, since they
-    // have to match this process's ABI, and slowly, since every one of them
-    // then runs under Rosetta / WOW64 / qemu. The user is the only one who can
-    // decide to switch, and cannot decide if nobody says it. Said at install
-    // time because that is when the cost is being incurred.
-    if (platform::is_emulated()) {
-        log::warn("this xlings is a {} build running on {} hardware; packages "
-                  "will match the build, not the machine. A native {} release "
-                  "avoids the emulation.",
-                  platform::build().arch, platform::host().arch,
-                  platform::host().str());
-    }
-    Config::reload_state();
-
-    auto& catalog = get_catalog();
-    if (!catalog.is_loaded()) {
-        log::error("package index not available");
-        return 1;
-    }
-
-    // Resolve up-front so the prompt and summary can show the canonical
-    // name + version + active subos. When the user did not pin a version,
-    // prefer the active one — catalog.resolve_target's default is the
-    // highest *declared* version, which may not be installed.
+// One target string ("name", "name@version", "ns:name@version"), resolved
+// and removed from whatever subos Config's active-subos override currently
+// points at. Everything from the self-binary guard through the uninstall
+// result diagnostics lives here so the `--all` (every version) loop in
+// cmd_remove_in_scope_ can call it once per version without duplicating any
+// of it.
+//
+// target: the ORIGINAL argument the user typed (unversioned in the common
+// case) -- used only for display and for composed hint commands.
+// resolveTarget: the concrete "name@version" this call actually acts on.
+int cmd_remove_resolved_(const std::string& target,
+                         const std::string& resolveTarget,
+                         bool yes, EventStream& stream, bool force,
+                         PackageCatalog& catalog,
+                         const std::string& subos,
+                         bool payloadlessUninstallProven) {
     std::string displayName = target;
     std::string displayVersion;
-    std::string subos = Config::paths().activeSubos;
-    bool payloadlessUninstallProven = false;
-
-    // 0.4.19+: subos-membership guard.
-    //
-    // Pre-fix: in a fresh (or pruned) subos, `xlings remove gcc` would
-    // reach the catalog, resolve to whatever version the recipe declared
-    // as "default", attempt detach (no-op since gcc is not in this
-    // subos's workspace), then succeed via the cross-subos refcount
-    // path because gcc IS installed in some OTHER subos. Net effect:
-    // confusing "✓ removed (subos: tmp)" output for a version the user
-    // never had. Refuse early and tell them where the package actually
-    // lives.
-    {
-        auto stripVer = [](const std::string& s) {
-            auto at = s.find('@');
-            return (at == std::string::npos) ? s : s.substr(0, at);
-        };
-        auto bareWithoutVer = stripVer(target);
-        auto bareName = bareWithoutVer.substr(bareWithoutVer.rfind(':') + 1);
-
-        const auto& ws  = Config::workspace();
-        const auto& wsi = Config::workspace_installed();
-        bool in_active    = ws.contains(bareName) && !ws.at(bareName).empty();
-        bool in_installed = wsi.contains(bareName) && !wsi.at(bareName).empty();
-
-        if (!in_active && !in_installed) {
-            // Which subos(es) DO have this package? Computed first, because it
-            // is what separates the two cases below.
-            auto referencing = xlings::profile::find_subos_referencing(
-                Config::paths().homeDir, bareName);
-            std::erase(referencing, subos);
-
-            if (!referencing.empty()) {
-                // The case this guard was written for (0.4.19+): the package
-                // lives in ANOTHER subos. Removing it here detaches rather
-                // than removes, and the cross-subos refcount path would then
-                // report "✓ removed (subos: tmp)" for a version the user never
-                // had. Refuse, and say where it actually lives.
-                //
-                // NOT `xvm::not_in_subos`. That builder was written for "you
-                // wanted to USE this", and 2026.8.22.1 reused it here for its
-                // wording -- inheriting its ACTIONS, which end with
-                //
-                //     install it here   xlings install <name>
-                //
-                // offered to somebody who had just asked to remove it. The
-                // last step out of a failed removal cannot be the inverse of
-                // the request. The same condition is answered ~100 lines below
-                // by `xim.remove_absent` with an action that fits, so the
-                // reuse bought one wording at the price of two answerers.
-                //
-                // Same code as that one now, and the same shape: the fact says
-                // where it lives, the actions stay on the verb the user typed.
-                // Level Warn and exit 0 -- `remove` of something that is not
-                // here is a no-op scripts re-run defensively, which is a
-                // different contract from `use`.
-                std::string where;
-                for (const auto& n : referencing) {
-                    if (!where.empty()) where += ", ";
-                    where += n;
-                }
-                diag::emit({
-                    .level   = diag::Level::Warn,
-                    .code    = "xim.remove_absent",
-                    .summary = std::format(
-                        "{} is not installed in this subos ({}), so there is "
-                        "nothing to remove", bareName,
-                        subos.empty() ? "default" : subos),
-                    .facts   = { { "installed in subos", where } },
-                    .actions = {
-                        { "see what is here", "xlings list" },
-                        // The only next step the user plausibly wants, and it
-                        // is a removal rather than an installation.
-                        { "remove it there",
-                          std::format("xlings subos use {} && xlings remove {}",
-                                      referencing.front(), bareName) },
-                    },
-                });
-                return 0;
-            }
-
-            // No subos claims it. Ask the disk before concluding it is absent
-            // -- the two workspace tables are bookkeeping, and a payload can
-            // outlive them (openxlings/xlings#511).
-            //
-            // Answering "not installed" here while a payload sits in xpkgs/ is
-            // not a harmless no-op: `install` treats a present payload
-            // directory as already installed and skips the install AND its
-            // config() hook. So `install -> remove (success) -> install` leaves
-            // a package whose config() never runs again. That is the same
-            // cascade that produced the aarch64 failure in #509, where an
-            // unconfigured gcc payload emitted binaries carrying the packaging
-            // machine's PT_INTERP and the error named the wrong file entirely.
-            bool payloadOnDisk = false;
-            {
-                namespace fs = std::filesystem;
-                const auto store = Config::paths().dataDir / "xpkgs";
-                std::error_code pec;
-                if (fs::is_directory(store, pec)) {
-                    for (const auto& pkgDir : platform::dir_entries(store)) {
-                        if (!pkgDir.is_directory()) continue;
-                        const auto storeName = pkgDir.path().filename().string();
-                        auto marker = storeName.find("-x-");
-                        if (marker == std::string::npos) continue;
-                        if (storeName.substr(marker + 3) != bareName) continue;
-                        for (const auto& verDir :
-                             platform::dir_entries(pkgDir.path())) {
-                            if (!verDir.is_directory()) continue;
-                            if (payload_has_content(verDir.path())) {
-                                payloadOnDisk = true;
-                                break;
-                            }
-                        }
-                        if (payloadOnDisk) break;
-                    }
-                }
-            }
-
-            if (!payloadOnDisk) {
-                // Nothing here is installed. The only question left is whether
-                // this coordinate is a payloadless config whose uninstall hook
-                // still has work to do -- and being unable to answer it is not
-                // the same as answering "yes".
-                //
-                // What an unanswerable question MEANS depends on how the user
-                // asked it, and these are two different questions:
-                //
-                //   `remove pkg`        -- "make sure pkg is gone". Scripts
-                //       re-run this defensively, and a package whose recipe has
-                //       left the index is as gone as it gets. Warn, exit 0.
-                //       That is the convention the block below states.
-                //   `remove pkg@9.9.9`  -- "remove THIS version". Nothing here
-                //       has it and the index has never heard of it, so the
-                //       coordinate itself is wrong. Say so and fail; reporting
-                //       success would confirm a removal of something that
-                //       cannot exist.
-                const bool explicitVersion = target.contains('@');
-                auto selected = catalog.resolve_target(
-                    target, detect_platform());
-                std::expected<bool, std::string> executable = false;
-                if (selected) {
-                    executable = selected_payloadless_config_has_uninstall_(
-                        catalog, *selected, detect_platform());
-                }
-                if (!selected || !executable) {
-                    const auto reason = selected ? executable.error()
-                                                 : selected.error();
-                    if (explicitVersion) {
-                        stream.emit(ErrorEvent{
-                            .code = reason.contains("ambiguous")
-                                ? ErrorCode::InvalidInput
-                                : ErrorCode::NotFound,
-                            .message = reason,
-                            .recoverable = true,
-                            .hint = "verify the package coordinate, or drop "
-                                    "the version to remove whatever is installed",
-                        });
-                        return 1;
-                    }
-                    log::warn("xlings: cannot inspect an uninstall recipe for "
-                              "'{}' ({}); treating it as absent",
-                              target, reason);
-                }
-                if (executable && *executable) {
-                    payloadlessUninstallProven = true;
-                    log::info("{}@{} has an executable payloadless config "
-                              "uninstall; running it",
-                              selected->canonicalName, selected->version);
-                } else {
-                    // Genuinely absent. Here the "remove what isn't there is
-                    // success" convention is right (S4 of
-                    // remove_multi_version_test.sh asserts exit 0 and no
-                    // `removed.*subos` summary), so keep it -- with a visible
-                    // diagnostic, and without breaking scripts that re-run
-                    // `remove` defensively.
-                    diag::emit({
-                        .level   = diag::Level::Warn,
-                        .code    = "xim.remove_absent",
-                        .summary = std::format(
-                            "{} is not installed in this subos ({}), so there "
-                            "is nothing to remove", bareName,
-                            subos.empty() ? "default" : subos),
-                        .actions = { { "see what is here", "xlings list" } },
-                    });
-                    return 0;
-                }
-            }
-
-            if (payloadOnDisk) {
-                log::warn("xlings: '{}' is not registered in subos '{}', but a "
-                          "payload is on disk; removing it for real",
-                          bareName, subos);
-            }
-        }
-    }
-
-    std::string resolveTarget = target;
-    if (target.find('@') == std::string::npos) {
-        auto bareName = target.substr(target.rfind(':') + 1);
-
-        // `remove <name>` with several versions installed here: SAY SO.
-        //
-        // This started as a refusal -- list the candidates, exit 2, on the
-        // reasoning that in every error `remove` raises about multi-version
-        // state the active binding is not the version being complained about.
-        // E2E-13 killed it, and was right to: `remove <pkg>` taking the active
-        // version and re-pointing the binding at the highest survivor is a
-        // documented, tested contract (docs/bugfixes/2026-04-25-...), and
-        // "run it three times to clear three versions" is a loop people write.
-        // The evidence behind the refusal came from the ERROR paths of #541 ②;
-        // generalising it to the ordinary path was not supported by it.
-        //
-        // What survives is the half that was actually missing: the user cannot
-        // see that this package has other versions here, or how to name them.
-        // Same move as the entry binary in this release -- ANNOUNCE the
-        // divergence, do not refuse it -- and consistency with that is most of
-        // the argument.
-        //
-        // `--force` is exempt: the xpkg hook path (pkgmanager.remove) passes it
-        // precisely because a recipe swapping a provider mid-install has
-        // already reasoned about what it replaces, and an extra paragraph in
-        // the middle of an install helps nobody.
-        if (!force) {
-            const auto& wsi = Config::workspace_installed();
-            if (auto it = wsi.find(bareName);
-                it != wsi.end() && it->second.size() > 1) {
-                auto versions = it->second;
-                version_order::sort_desc(versions);
-                log::warn("'{}' has {} versions installed in subos '{}'; this "
-                          "removes the ACTIVE one only",
-                          bareName, versions.size(), subos);
-                for (const auto& v : versions) {
-                    log::warn("  xlings remove {}@{}", target, v);
-                }
-            }
-        }
-
-        auto active = xvm::get_active_version(
-            Config::effective_workspace(), bareName);
-        // Fall back to "any installed version" when the active binding
-        // has been cleared. The catalog's default version pick is the
-        // recipe's highest *declared* version, which may not match what's
-        // on disk. Before this fallback, a sequence like
-        //
-        //     xlings remove d2x        # detaches active binding
-        //     xlings use d2x           # error: 'd2x' not in version DB
-        //     xlings remove d2x        # ← still picks declared 0.1.4!
-        //
-        // would loop forever: each subsequent remove re-resolved to the
-        // recipe's latest, hit `installer.uninstall` as a no-op (xvm DB
-        // already empty, payload dir already gone), and printed
-        // "✓ removed" anyway. Picking from the xvm DB instead anchors
-        // the resolution to reality.
-        if (active.empty()) {
-            // The database has to outlive the pointer into it.
-            // Config::versions() returns by VALUE, so passing the call
-            // directly to get_vinfo() handed back a pointer into a temporary
-            // that died at the end of that full expression -- and the next
-            // line read it. Use-after-free: `xlings remove glibc` on a home
-            // where glibc is registered but not active SIGSEGV'd on the
-            // released musl-static build and threw bad_alloc on a glibc one,
-            // from pick_highest_version walking a map that was gone.
-            //
-            // Reported 2026-07-28; reproduces identically on 2026.7.27.2,
-            // .3 and .4, so it is as old as this fallback.
-            const auto db = Config::versions();
-            const auto* vinfo = xvm::get_vinfo(db, bareName);
-            if (vinfo && !vinfo->versions.empty()) {
-                active = xvm::pick_highest_version(vinfo->versions);
-            }
-        }
-        if (!active.empty()) {
-            resolveTarget = target + "@" + active;
-        }
+    if (auto at = resolveTarget.find('@'); at != std::string::npos) {
+        displayVersion = resolveTarget.substr(at + 1);
     }
 
     auto match = catalog.resolve_target(resolveTarget, detect_platform());
@@ -1247,10 +955,23 @@ int cmd_remove(const std::string& target, bool yes, EventStream& stream,
         // The xvm-DB fallback above already anchors resolution to a real
         // installed version when one exists, so reaching here with
         // `!installed` means nothing is installed for this target unless the
-        // payloadless-config proof above deliberately admitted its recipe.
+        // payloadless-config proof above deliberately admitted its recipe --
+        // OR the version DB itself still has a record for this exact
+        // target@version (a payload deleted out from under it by hand, for
+        // instance). `match->installed` only answers "is there a payload on
+        // disk"; a stale record with no payload is exactly the case removal
+        // exists to clean up, not a reason to leave it alone.
         if (!match->installed && !payloadlessUninstallProven) {
-            log::warn("{}@{} is not installed", displayName, displayVersion);
-            return 0;
+            bool hasDbRecord = false;
+            if (auto at = resolveTarget.find('@'); at != std::string::npos) {
+                auto bareTargetName = target.substr(target.rfind(':') + 1);
+                auto version = resolveTarget.substr(at + 1);
+                hasDbRecord = xvm::has_version(Config::versions(), bareTargetName, version);
+            }
+            if (!hasDbRecord) {
+                log::warn("{}@{} is not installed", displayName, displayVersion);
+                return 0;
+            }
         }
 
         // Guard against `xlings remove xim:xlings` when xlings has only
@@ -1412,25 +1133,69 @@ int cmd_remove(const std::string& target, bool yes, EventStream& stream,
     }
 
     Installer installer(catalog);
-    auto result = installer.uninstall(target);
+    auto result = installer.uninstall(resolveTarget);
     if (!result) {
         log::error("uninstall failed: {}", result.error());
         return 1;
     }
 
-    // Say which of the two things actually happened.
+    // Say what actually happened. Three shapes now, not two:
     //
-    // When another subos still pins this exact version, `remove` detaches the
-    // current subos and deliberately keeps the registration and the payload —
-    // deleting them would break every other subos that is using them. That is
-    // right. Printing "✓ removed" for it was not: the user is told the package
-    // is gone while ~/.xlings/.xlings.json and data/xpkgs/ still hold it in
-    // full, and the reinstall they try next tells them to uninstall first
-    // (#443, and the closed loop in #422).
-    //
-    // The subos are named rather than merely counted because that is the whole
-    // remedy: removing it from each of them in turn lets the last one delete
-    // the payload for real.
+    //   -- detachedOnly: another subos still pins this exact version.
+    //      Deliberately keeps the registration and the payload — deleting
+    //      them would break every other subos using them (#443, #422).
+    //   -- hookFailure non-empty: the recipe's own uninstall() threw, but
+    //      state (version DB, workspace binding, shim, payload) was
+    //      withdrawn regardless. `--force` accepts that as done; without
+    //      it, `remove` reports the failure and exits non-zero so a script
+    //      does not treat a half-clean recipe as a quiet success.
+    //   -- recipeUnavailable: no index could resolve this package's recipe
+    //      at all, so nothing ran except the default removal op.
+    int rc = 0;
+    if (!result->hookFailure.empty()) {
+        // First line only: the rest (a stack trace, a multi-line lua error)
+        // belongs to the log the hook already wrote, not to a one-line fact.
+        std::string firstLine = result->hookFailure;
+        if (auto nl = firstLine.find('\n'); nl != std::string::npos) {
+            firstLine = firstLine.substr(0, nl);
+        }
+        if (force) {
+            diag::emit({
+                .level   = diag::Level::Note,
+                .code    = "xim.uninstall_hook_failed",
+                .summary = std::format(
+                    "{}@{}'s uninstall hook failed, but it is gone anyway "
+                    "(--force)", displayName, displayVersion),
+                .facts   = { { "hook error", firstLine } },
+            });
+        } else {
+            diag::emit({
+                .level   = diag::Level::Warn,
+                .code    = "xim.uninstall_hook_failed",
+                .summary = std::format(
+                    "{}@{}'s uninstall hook failed", displayName, displayVersion),
+                .facts   = {
+                    { "hook error", firstLine },
+                    { "state withdrawn", "yes" },
+                },
+                .actions = {
+                    { "finish anyway",
+                      std::format("xlings remove {} --force -y", target) },
+                },
+            });
+            rc = 1;
+        }
+    }
+    if (result->recipeUnavailable) {
+        diag::emit({
+            .level   = diag::Level::Note,
+            .code    = "xim.uninstall_recipe_unavailable",
+            .summary = std::format(
+                "no index provides {}'s recipe anymore; its registration "
+                "and payload were removed directly", displayName),
+        });
+    }
+
     std::vector<std::string> pinnedBy;
     if (result->detachedOnly) {
         pinnedBy = xlings::profile::find_subos_pinning_version(
@@ -1447,7 +1212,464 @@ int cmd_remove(const std::string& target, bool yes, EventStream& stream,
     summaryPayload["detached"] = result->detachedOnly;
     summaryPayload["pinned_by"] = pinnedBy;
     stream.emit(DataEvent{"remove_summary", summaryPayload.dump()});
-    return 0;
+    return rc;
+}
+
+// One target, one subos context (whatever Config's active-subos override
+// currently points at). Handles the membership guard, DB-first version
+// resolution (including `--all`), and dispatches to cmd_remove_resolved_
+// once per version.
+int cmd_remove_in_scope_(const std::string& target, bool yes,
+                         EventStream& stream, bool force, bool all,
+                         PackageCatalog& catalog) {
+    // Resolve up-front so the prompt and summary can show the canonical
+    // name + version + active subos. When the user did not pin a version,
+    // prefer the active one — catalog.resolve_target's default is the
+    // highest *declared* version, which may not be installed.
+    std::string subos = Config::paths().activeSubos;
+    bool payloadlessUninstallProven = false;
+
+    // 0.4.19+: subos-membership guard.
+    //
+    // Pre-fix: in a fresh (or pruned) subos, `xlings remove gcc` would
+    // reach the catalog, resolve to whatever version the recipe declared
+    // as "default", attempt detach (no-op since gcc is not in this
+    // subos's workspace), then succeed via the cross-subos refcount
+    // path because gcc IS installed in some OTHER subos. Net effect:
+    // confusing "✓ removed (subos: tmp)" output for a version the user
+    // never had. Refuse early and tell them where the package actually
+    // lives.
+    {
+        auto stripVer = [](const std::string& s) {
+            auto at = s.find('@');
+            return (at == std::string::npos) ? s : s.substr(0, at);
+        };
+        auto bareWithoutVer = stripVer(target);
+        auto bareName = bareWithoutVer.substr(bareWithoutVer.rfind(':') + 1);
+
+        const auto& ws  = Config::workspace();
+        const auto& wsi = Config::workspace_installed();
+        bool in_active    = ws.contains(bareName) && !ws.at(bareName).empty();
+        bool in_installed = wsi.contains(bareName) && !wsi.at(bareName).empty();
+
+        if (!in_active && !in_installed) {
+            // Which subos(es) DO have this package? Computed first, because it
+            // is what separates the two cases below.
+            auto referencing = xlings::profile::find_subos_referencing(
+                Config::paths().homeDir, bareName);
+            std::erase(referencing, subos);
+
+            if (!referencing.empty()) {
+                // The case this guard was written for (0.4.19+): the package
+                // lives in ANOTHER subos. Removing it here detaches rather
+                // than removes, and the cross-subos refcount path would then
+                // report "✓ removed (subos: tmp)" for a version the user never
+                // had. Refuse, and say where it actually lives.
+                //
+                // NOT `xvm::not_in_subos`. That builder was written for "you
+                // wanted to USE this", and 2026.8.22.1 reused it here for its
+                // wording -- inheriting its ACTIONS, which end with
+                //
+                //     install it here   xlings install <name>
+                //
+                // offered to somebody who had just asked to remove it. The
+                // last step out of a failed removal cannot be the inverse of
+                // the request. The same condition is answered ~100 lines below
+                // by `xim.remove_absent` with an action that fits, so the
+                // reuse bought one wording at the price of two answerers.
+                //
+                // Same code as that one now, and the same shape: the fact says
+                // where it lives, the actions stay on the verb the user typed.
+                // Level Warn and exit 0 -- `remove` of something that is not
+                // here is a no-op scripts re-run defensively, which is a
+                // different contract from `use`.
+                std::string where;
+                for (const auto& n : referencing) {
+                    if (!where.empty()) where += ", ";
+                    where += n;
+                }
+                diag::emit({
+                    .level   = diag::Level::Warn,
+                    .code    = "xim.remove_absent",
+                    .summary = std::format(
+                        "{} is not installed in this subos ({}), so there is "
+                        "nothing to remove", bareName,
+                        subos.empty() ? "default" : subos),
+                    .facts   = { { "installed in subos", where } },
+                    .actions = {
+                        { "see what is here", "xlings list" },
+                        // The only next step the user plausibly wants, and it
+                        // is a removal rather than an installation.
+                        { "remove it there",
+                          std::format("xlings subos use {} && xlings remove {}",
+                                      referencing.front(), bareName) },
+                        // Task 5: the scripted version of switching to each
+                        // referencing subos and removing it there by hand.
+                        { "remove it everywhere",
+                          std::format("xlings remove {} --all-subos", bareName) },
+                    },
+                });
+                return 0;
+            }
+
+            // No subos claims it. Ask the disk before concluding it is absent
+            // -- the two workspace tables are bookkeeping, and a payload can
+            // outlive them (openxlings/xlings#511).
+            //
+            // Answering "not installed" here while a payload sits in xpkgs/ is
+            // not a harmless no-op: `install` treats a present payload
+            // directory as already installed and skips the install AND its
+            // config() hook. So `install -> remove (success) -> install` leaves
+            // a package whose config() never runs again. That is the same
+            // cascade that produced the aarch64 failure in #509, where an
+            // unconfigured gcc payload emitted binaries carrying the packaging
+            // machine's PT_INTERP and the error named the wrong file entirely.
+            bool payloadOnDisk = false;
+            {
+                namespace fs = std::filesystem;
+                const auto store = Config::paths().dataDir / "xpkgs";
+                std::error_code pec;
+                if (fs::is_directory(store, pec)) {
+                    for (const auto& pkgDir : platform::dir_entries(store)) {
+                        if (!pkgDir.is_directory()) continue;
+                        const auto storeName = pkgDir.path().filename().string();
+                        auto marker = storeName.find("-x-");
+                        if (marker == std::string::npos) continue;
+                        if (storeName.substr(marker + 3) != bareName) continue;
+                        for (const auto& verDir :
+                             platform::dir_entries(pkgDir.path())) {
+                            if (!verDir.is_directory()) continue;
+                            if (payload_has_content(verDir.path())) {
+                                payloadOnDisk = true;
+                                break;
+                            }
+                        }
+                        if (payloadOnDisk) break;
+                    }
+                }
+            }
+
+            if (!payloadOnDisk) {
+                // Nothing here is installed. The only question left is whether
+                // this coordinate is a payloadless config whose uninstall hook
+                // still has work to do -- and being unable to answer it is not
+                // the same as answering "yes".
+                //
+                // What an unanswerable question MEANS depends on how the user
+                // asked it, and these are two different questions:
+                //
+                //   `remove pkg`        -- "make sure pkg is gone". Scripts
+                //       re-run this defensively, and a package whose recipe has
+                //       left the index is as gone as it gets. Warn, exit 0.
+                //       That is the convention the block below states.
+                //   `remove pkg@9.9.9`  -- "remove THIS version". Nothing here
+                //       has it and the index has never heard of it, so the
+                //       coordinate itself is wrong. Say so and fail; reporting
+                //       success would confirm a removal of something that
+                //       cannot exist.
+                const bool explicitVersion = target.contains('@');
+                auto selected = catalog.resolve_target(
+                    target, detect_platform());
+                std::expected<bool, std::string> executable = false;
+                if (selected) {
+                    executable = selected_payloadless_config_has_uninstall_(
+                        catalog, *selected, detect_platform());
+                }
+                if (!selected || !executable) {
+                    const auto reason = selected ? executable.error()
+                                                 : selected.error();
+                    if (explicitVersion) {
+                        stream.emit(ErrorEvent{
+                            .code = reason.contains("ambiguous")
+                                ? ErrorCode::InvalidInput
+                                : ErrorCode::NotFound,
+                            .message = reason,
+                            .recoverable = true,
+                            .hint = "verify the package coordinate, or drop "
+                                    "the version to remove whatever is installed",
+                        });
+                        return 1;
+                    }
+                    log::warn("xlings: cannot inspect an uninstall recipe for "
+                              "'{}' ({}); treating it as absent",
+                              target, reason);
+                }
+                if (executable && *executable) {
+                    payloadlessUninstallProven = true;
+                    log::info("{}@{} has an executable payloadless config "
+                              "uninstall; running it",
+                              selected->canonicalName, selected->version);
+                } else {
+                    // Genuinely absent. Here the "remove what isn't there is
+                    // success" convention is right (S4 of
+                    // remove_multi_version_test.sh asserts exit 0 and no
+                    // `removed.*subos` summary), so keep it -- with a visible
+                    // diagnostic, and without breaking scripts that re-run
+                    // `remove` defensively.
+                    diag::emit({
+                        .level   = diag::Level::Warn,
+                        .code    = "xim.remove_absent",
+                        .summary = std::format(
+                            "{} is not installed in this subos ({}), so there "
+                            "is nothing to remove", bareName,
+                            subos.empty() ? "default" : subos),
+                        .actions = { { "see what is here", "xlings list" } },
+                    });
+                    return 0;
+                }
+            }
+
+            if (payloadOnDisk) {
+                log::warn("xlings: '{}' is not registered in subos '{}', but a "
+                          "payload is on disk; removing it for real",
+                          bareName, subos);
+            }
+        }
+    }
+
+    // DB-first resolution of which version(s) to act on. `resolve_target`
+    // (inside cmd_remove_resolved_) is used only for the display name and
+    // the payload-on-disk check from here on -- a recipe that has left every
+    // index must not block a removal the version DB alone can already do
+    // (openxlings/xlings#578).
+    std::vector<std::string> resolveTargets;
+    if (target.find('@') != std::string::npos) {
+        resolveTargets = { target };
+    } else {
+        auto bareName = target.substr(target.rfind(':') + 1);
+
+        if (all) {
+            // `--all`: every version this target has in the DB, highest
+            // first, each going through the full pipeline below.
+            const auto db = Config::versions();
+            const auto* vinfo = xvm::get_vinfo(db, bareName);
+            std::vector<std::string> versions;
+            if (vinfo) {
+                for (const auto& [v, _] : vinfo->versions) versions.push_back(v);
+                version_order::sort_desc(versions);
+            }
+            if (versions.empty()) {
+                // Nothing registered under this name -- fall through to the
+                // ordinary single-shot path so the payloadless-config /
+                // absent handling above still decides the outcome.
+                resolveTargets = { target };
+            } else {
+                for (const auto& v : versions) {
+                    resolveTargets.push_back(target + "@" + v);
+                }
+            }
+        } else {
+            // `remove <name>` with several versions installed here: SAY SO.
+            //
+            // This started as a refusal -- list the candidates, exit 2, on the
+            // reasoning that in every error `remove` raises about multi-version
+            // state the active binding is not the version being complained about.
+            // E2E-13 killed it, and was right to: `remove <pkg>` taking the active
+            // version and re-pointing the binding at the highest survivor is a
+            // documented, tested contract (docs/bugfixes/2026-04-25-...), and
+            // "run it three times to clear three versions" is a loop people write.
+            // The evidence behind the refusal came from the ERROR paths of #541 ②;
+            // generalising it to the ordinary path was not supported by it.
+            //
+            // What survives is the half that was actually missing: the user cannot
+            // see that this package has other versions here, or how to name them.
+            // Same move as the entry binary in this release -- ANNOUNCE the
+            // divergence, do not refuse it -- and consistency with that is most of
+            // the argument.
+            //
+            // `--force` is exempt: the xpkg hook path (pkgmanager.remove) passes it
+            // precisely because a recipe swapping a provider mid-install has
+            // already reasoned about what it replaces, and an extra paragraph in
+            // the middle of an install helps nobody.
+            if (!force) {
+                const auto& wsi = Config::workspace_installed();
+                if (auto it = wsi.find(bareName);
+                    it != wsi.end() && it->second.size() > 1) {
+                    auto versions = it->second;
+                    version_order::sort_desc(versions);
+                    log::warn("'{}' has {} versions installed in subos '{}'; this "
+                              "removes the ACTIVE one only",
+                              bareName, versions.size(), subos);
+                    for (const auto& v : versions) {
+                        log::warn("  xlings remove {}@{}", target, v);
+                    }
+                }
+            }
+
+            auto active = xvm::get_active_version(
+                Config::effective_workspace(), bareName);
+            // Fall back to the DB when the active binding has been cleared
+            // (or never set -- #578: a record with no active binding at
+            // all). The catalog's default version pick is the recipe's
+            // highest *declared* version, which may not match what's on
+            // disk; picking from the xvm DB instead anchors the resolution
+            // to reality. Only silently, though, when there is exactly one
+            // candidate -- with several and no active binding, which one
+            // the user means is a real question, not a default to guess.
+            if (active.empty()) {
+                // The database has to outlive the pointer into it.
+                // Config::versions() returns by VALUE, so passing the call
+                // directly to get_vinfo() handed back a pointer into a
+                // temporary that died at the end of that full expression --
+                // and the next line read it. Use-after-free: `xlings remove
+                // glibc` on a home where glibc is registered but not active
+                // SIGSEGV'd on the released musl-static build and threw
+                // bad_alloc on a glibc one, from pick_highest_version
+                // walking a map that was gone.
+                //
+                // Reported 2026-07-28; reproduces identically on 2026.7.27.2,
+                // .3 and .4, so it is as old as this fallback.
+                const auto db = Config::versions();
+                const auto* vinfo = xvm::get_vinfo(db, bareName);
+                if (vinfo && !vinfo->versions.empty()) {
+                    if (vinfo->versions.size() == 1) {
+                        active = vinfo->versions.begin()->first;
+                    } else {
+                        std::vector<std::string> versions;
+                        for (const auto& [v, _] : vinfo->versions) {
+                            versions.push_back(v);
+                        }
+                        version_order::sort_desc(versions);
+                        log::error(
+                            "'{}' has {} versions installed in subos '{}' and "
+                            "none is active; say which one",
+                            bareName, versions.size(), subos);
+                        for (const auto& v : versions) {
+                            log::println("  xlings remove {}@{}", target, v);
+                        }
+                        log::println(
+                            "  or remove all of them: xlings remove {} --all",
+                            target);
+                        return 2;
+                    }
+                }
+            }
+            resolveTargets = { active.empty() ? target : (target + "@" + active) };
+        }
+    }
+
+    int rc = 0;
+    for (const auto& resolveTarget : resolveTargets) {
+        int one = cmd_remove_resolved_(target, resolveTarget, yes, stream,
+                                       force, catalog, subos,
+                                       payloadlessUninstallProven);
+        if (one != 0) rc = one;
+    }
+    return rc;
+}
+
+int cmd_remove(const std::string& target, bool yes, EventStream& stream,
+               bool force, bool all, std::optional<std::string> subosScope) {
+    // Serialize against any other xlings mutating this home, then re-read
+    // state under the lock: Config loaded it at process start, outside the
+    // lock, so acting on that snapshot is how two commands lose each other's
+    // work. See xvm/lock.cppm.
+    auto stateLock = xvm::acquire_state_lock(Config::paths().homeDir);
+    if (!stateLock) {
+        log::error("{}", stateLock.error());
+        return 1;
+    }
+
+    // An emulated build installs emulated packages -- correctly, since they
+    // have to match this process's ABI, and slowly, since every one of them
+    // then runs under Rosetta / WOW64 / qemu. The user is the only one who can
+    // decide to switch, and cannot decide if nobody says it. Said at install
+    // time because that is when the cost is being incurred.
+    if (platform::is_emulated()) {
+        log::warn("this xlings is a {} build running on {} hardware; packages "
+                  "will match the build, not the machine. A native {} release "
+                  "avoids the emulation.",
+                  platform::build().arch, platform::host().arch,
+                  platform::host().str());
+    }
+    Config::reload_state();
+
+    auto& catalog = get_catalog();
+    if (!catalog.is_loaded()) {
+        log::error("package index not available");
+        return 1;
+    }
+
+    auto stripVer = [](const std::string& s) {
+        auto at = s.find('@');
+        return (at == std::string::npos) ? s : s.substr(0, at);
+    };
+    auto bareWithoutVer = stripVer(target);
+    auto bareName = bareWithoutVer.substr(bareWithoutVer.rfind(':') + 1);
+
+    // Which subos(es) this removal acts on. "" is the sentinel for "current,
+    // no override" -- the common case, and the one every pre-existing
+    // contract (remove_multi_version_test.sh and friends) is written
+    // against, so it takes the exact code path it always did.
+    std::vector<std::string> subosNames;
+    if (subosScope && *subosScope == "*") {
+        // `--all-subos`: every subos that actually references the target.
+        subosNames = xlings::profile::find_subos_referencing(
+            Config::paths().homeDir, bareName);
+        // Nothing references it anywhere -- stay on the ordinary path so
+        // the usual "nothing to remove" diagnostic fires instead of this
+        // flag silently doing nothing.
+        if (subosNames.empty()) subosNames.push_back(std::string{});
+    } else if (subosScope && !subosScope->empty()) {
+        // `--subos NAME`: exactly that one, whether or not it currently has
+        // the target -- the membership guard inside the scope decides that.
+        subosNames = { *subosScope };
+    } else if (!subosScope) {
+        // Neither flag: stay on the current subos, UNLESS the target is
+        // absent here, present elsewhere, and the caller already said `-y`
+        // -- i.e. is not going to be asked a question about a subos it
+        // never named. Interactively (no `-y`), the membership guard's
+        // "remove it everywhere" action below is the manual equivalent.
+        const auto& ws  = Config::workspace();
+        const auto& wsi = Config::workspace_installed();
+        bool inActive    = ws.contains(bareName) && !ws.at(bareName).empty();
+        bool inInstalled = wsi.contains(bareName) && !wsi.at(bareName).empty();
+        if (!inActive && !inInstalled && yes) {
+            auto referencing = xlings::profile::find_subos_referencing(
+                Config::paths().homeDir, bareName);
+            std::erase(referencing, Config::paths().activeSubos);
+            if (!referencing.empty()) subosNames = referencing;
+        }
+        if (subosNames.empty()) subosNames.push_back(std::string{});
+    } else {
+        // subosScope holds "" explicitly: current only.
+        subosNames.push_back(std::string{});
+    }
+
+    int rc = 0;
+    for (const auto& name : subosNames) {
+        const bool switchSubos = !name.empty();
+        std::string prevEnv;
+        std::string prevOverride;
+        if (switchSubos) {
+            // Both, and that is not belt-and-braces: the override is what
+            // recomputes Config's cached paths/workspace, and
+            // XLINGS_ACTIVE_SUBOS is what the activation path re-reads for
+            // itself. Same pairing subos.cpp uses for the same reason.
+            prevEnv = utils::get_env_or_default("XLINGS_ACTIVE_SUBOS");
+            platform::set_env_variable("XLINGS_ACTIVE_SUBOS", name);
+            prevOverride = Config::set_active_subos_override(name);
+            // set_active_subos_override's own reload reads the OLD
+            // paths_.activeSubos (it updates the workspace before it
+            // recomputes which subos that even means), so the workspace it
+            // just loaded is still the PREVIOUS subos's, not `name`'s.
+            // subos.cpp's own uses of this override never notice, because
+            // they hand off to cmd_install, which reloads again on its own
+            // -- by which point paths_.activeSubos has already caught up
+            // and that second reload gets it right. `remove` does not call
+            // into another command that reloads for it, so it has to ask
+            // for that second reload itself.
+            Config::reload_state();
+        }
+        int one = cmd_remove_in_scope_(target, yes, stream, force, all, catalog);
+        if (one != 0) rc = one;
+        if (switchSubos) {
+            (void)Config::set_active_subos_override(prevOverride);
+            Config::reload_state();
+            platform::set_env_variable("XLINGS_ACTIVE_SUBOS", prevEnv);
+        }
+    }
+    return rc;
 }
 
 int cmd_search(const std::string& keyword, EventStream& stream) {
