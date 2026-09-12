@@ -31,6 +31,7 @@ import xlings.core.xvm.removal;
 import xlings.core.xvm.registration;
 import xlings.core.xvm.errors;
 import xlings.core.subos.manifest;
+import xlings.core.profile;
 import xlings.core.xvm.commands;
 import xlings.core.xvm.shim;
 import xlings.core.xim.libxpkg.types.script;
@@ -1953,158 +1954,223 @@ bool process_xvm_operations_(const PlanNode& node,
         }
     }
 
-    for (const auto& effect : metadata->effects) {
-        auto resolved = resolve_xpkg_filesystem_effect(
-            scopedDb, scopedWorkspace, effect);
-        if (!resolved) {
-            log::warn(
-                "validated xvm effect target disappeared or changed kind: "
-                "{}@{}",
-                effect.target, effect.version);
-            continue;
-        }
-        if (resolved->kind
-            == XpkgFilesystemEffectKind::InstallHeaders) {
-            if (!resolved->active) {
-                // Installing a non-active version must not disturb the
-                // sysroot: `xlings use` is what moves headers, and it cannot
-                // undo this because switching to an already-active version
-                // is a no-op.
-                log::debug("[xim] headers for {}@{} not installed: not the "
-                           "active version", resolved->target, resolved->version);
-                continue;
-            }
-            xvm::install_headers(
-                resolved->sourceDir, sysroot_include);
-            continue;
-        }
-        if (resolved->kind
-            == XpkgFilesystemEffectKind::RemoveHeaders) {
-            xvm::remove_headers(
-                resolved->sourceDir, sysroot_include);
-            continue;
-        }
-        if (resolved->kind
-            == XpkgFilesystemEffectKind::ProgramShim) {
-            // A shim is only meaningful for a name that has an active
-            // version -- that is what shim_dispatch resolves against, and
-            // without one the file can only ever print "no active version
-            // of 'X' in current subos". Writing it anyway is what produced
-            // doctor's `orphan shim`, an error the user could not fix:
-            // `--fix` deleted the file and the next install recreated it.
-            //
-            // Registration deliberately withholds activation from a release
-            // whose group already has an active member (see
-            // registration.cppm, `activateGroup`), so every name that is new
-            // in that release lands here. The sibling effects below already
-            // guard on activation; this one did not.
-            //
-            // The question is about the NAME, not this version: a second
-            // version of an active program must not delete or skip the shim
-            // its active sibling needs. And a name activated later still
-            // gets its file -- `cmd_use` creates shims for every member of
-            // the release it switches to (xvm/commands.cppm).
-            const auto activeIt = scopedWorkspace.find(resolved->target);
-            const bool nameHasActiveVersion =
-                activeIt != scopedWorkspace.end()
-                && !activeIt->second.empty();
-            if (!nameHasActiveVersion) {
-                log::debug(
-                    "[xim] shim for {}@{} not created: no active version of "
-                    "'{}' in this subos",
-                    resolved->target, effect.version, resolved->target);
-                continue;
-            }
-            // The file itself is not written here any more.
-            //
-            // `xself::sync_shim_tables()` below derives the whole routing
-            // table from the workspace once the install has finished, which
-            // is what removed the second half of this block: a project-scope
-            // mirror into the global bin that nothing recorded and nothing
-            // could reclaim. Reaching this point still means "this name is
-            // active here", which is exactly what the table will conclude.
+    // Places this batch's filesystem effects (headers, file assets,
+    // libraries, shims) into ONE subos's sysroot. Extracted so a
+    // registration rewrite can be replayed against every OTHER subos that
+    // pins this version too (#586) without duplicating the per-effect-kind
+    // logic -- the call below for the CURRENT subos is unchanged from
+    // before the extraction.
+    //
+    // `ws` is what gates every `resolved->active` check inside
+    // `resolve_xpkg_filesystem_effect` and the shim branch's own lookup:
+    // passing another subos's workspace here is what makes this only ever
+    // place what THAT subos has made active, never something of ours.
+    // `scopedDb` (the version DB), `xlings_bin` and `shim_ext` stay captured
+    // from the enclosing scope -- they describe the shared payload store and
+    // the one home-level entry binary, neither of which is per-subos.
+    // `wsi` is accepted for symmetry with the per-subos state the caller
+    // passes (`Config::workspace_installed()`); no effect kind placed here
+    // needs it today.
+    auto place_effects_into = [&](const std::filesystem::path& subosDir,
+                                   const xvm::Workspace& ws,
+                                   const xvm::WorkspaceInstalled& wsi) {
+        (void)wsi;
+        const auto binDir = subosDir / "bin";
+        const auto libDir = subosDir / "lib";
+        const auto includeDir = subosDir / "usr" / "include";
 
-            if (resolved->active
-                && xvm::is_xlings_binary(resolved->target)
-                && std::filesystem::exists(xlings_bin)
-                && !resolved->path.empty()
-                && !resolved->sourceName.empty()) {
-                auto activeName = resolved->sourceName;
-                if (!shim_ext.empty()
-                    && !activeName.ends_with(shim_ext)) {
-                    activeName += shim_ext;
-                }
-                const auto activeBin =
-                    std::filesystem::path(resolved->path)
-                    / activeName;
-                if (std::filesystem::exists(activeBin)) {
-                    // The same writer `xlings use xlings <v>` goes through.
-                    // Two independent replacements of the one file every shim
-                    // dispatches through is how a home ends up running a
-                    // client nobody chose -- see entry_binary.cppm.
-                    entry_binary::replace_with(
-                        activeBin, xlings_bin,
-                        std::format("{}@{}", resolved->target, effect.version),
-                        effect.version);
-                }
-                xself::compat::v0_4_8::cleanup_legacy_alias_shims(
-                    artifactBinDir, xlings_bin);
-            }
-            continue;
-        }
-        if (resolved->kind == XpkgFilesystemEffectKind::FileAsset) {
-            if (!resolved->active) {
-                log::debug("[xim] file asset {}@{} not placed: not the "
-                           "active version", resolved->target,
-                           resolved->version);
+        for (const auto& effect : metadata->effects) {
+            auto resolved = resolve_xpkg_filesystem_effect(
+                scopedDb, ws, effect);
+            if (!resolved) {
+                log::warn(
+                    "validated xvm effect target disappeared or changed kind: "
+                    "{}@{}",
+                    effect.target, effect.version);
                 continue;
             }
-            if (const auto file = xvm::file_placement(
-                    scopedDb, resolved->target, resolved->version,
-                    Config::paths().homeDir.string());
-                !file.empty()) {
-                xvm::place_asset(file.source,
-                                 artifactSubosDir / file.destination);
-            } else {
-                log::warn("[xim] file asset {}@{} declares no usable "
-                          "destination; nothing placed",
-                          resolved->target, resolved->version);
+            if (resolved->kind
+                == XpkgFilesystemEffectKind::InstallHeaders) {
+                if (!resolved->active) {
+                    // Installing a non-active version must not disturb the
+                    // sysroot: `xlings use` is what moves headers, and it cannot
+                    // undo this because switching to an already-active version
+                    // is a no-op.
+                    log::debug("[xim] headers for {}@{} not installed: not the "
+                               "active version", resolved->target, resolved->version);
+                    continue;
+                }
+                xvm::install_headers(
+                    resolved->sourceDir, includeDir);
+                continue;
             }
-            continue;
-        }
-        if (resolved->kind != XpkgFilesystemEffectKind::Library
-            || resolved->path.empty()) {
-            continue;
-        }
-        if (!resolved->active) {
-            // Installing a version that does not become active must not
-            // disturb the sysroot. `InstallHeaders` has been gated this way
-            // since 0.4.70; `Library` was not, so installing a second version
-            // of a package overwrote the active version's library while its
-            // headers stayed put -- the sysroot then held a library from one
-            // release beside headers from another, which compiles and fails
-            // at run time. `xlings use` is what moves libraries.
-            log::debug("[xim] library {}@{} not placed: not the active "
-                       "version", resolved->target, resolved->version);
-            continue;
-        }
+            if (resolved->kind
+                == XpkgFilesystemEffectKind::RemoveHeaders) {
+                xvm::remove_headers(
+                    resolved->sourceDir, includeDir);
+                continue;
+            }
+            if (resolved->kind
+                == XpkgFilesystemEffectKind::ProgramShim) {
+                // A shim is only meaningful for a name that has an active
+                // version -- that is what shim_dispatch resolves against, and
+                // without one the file can only ever print "no active version
+                // of 'X' in current subos". Writing it anyway is what produced
+                // doctor's `orphan shim`, an error the user could not fix:
+                // `--fix` deleted the file and the next install recreated it.
+                //
+                // Registration deliberately withholds activation from a release
+                // whose group already has an active member (see
+                // registration.cppm, `activateGroup`), so every name that is new
+                // in that release lands here. The sibling effects below already
+                // guard on activation; this one did not.
+                //
+                // The question is about the NAME, not this version: a second
+                // version of an active program must not delete or skip the shim
+                // its active sibling needs. And a name activated later still
+                // gets its file -- `cmd_use` creates shims for every member of
+                // the release it switches to (xvm/commands.cppm).
+                const auto activeIt = ws.find(resolved->target);
+                const bool nameHasActiveVersion =
+                    activeIt != ws.end()
+                    && !activeIt->second.empty();
+                if (!nameHasActiveVersion) {
+                    log::debug(
+                        "[xim] shim for {}@{} not created: no active version of "
+                        "'{}' in this subos",
+                        resolved->target, effect.version, resolved->target);
+                    continue;
+                }
+                // The file itself is not written here any more.
+                //
+                // `xself::sync_shim_tables()` below derives the whole routing
+                // table from the workspace once the install has finished, which
+                // is what removed the second half of this block: a project-scope
+                // mirror into the global bin that nothing recorded and nothing
+                // could reclaim. Reaching this point still means "this name is
+                // active here", which is exactly what the table will conclude.
 
-        const auto source =
-            std::filesystem::path(resolved->path)
-            / resolved->sourceName;
-        const auto destination =
-            sysroot_lib / resolved->destinationName;
-        std::filesystem::create_directories(sysroot_lib);
-        std::error_code ec;
-        if (std::filesystem::exists(destination, ec)
-            || std::filesystem::is_symlink(destination, ec)) {
-            std::filesystem::remove(destination, ec);
+                if (resolved->active
+                    && xvm::is_xlings_binary(resolved->target)
+                    && std::filesystem::exists(xlings_bin)
+                    && !resolved->path.empty()
+                    && !resolved->sourceName.empty()) {
+                    auto activeName = resolved->sourceName;
+                    if (!shim_ext.empty()
+                        && !activeName.ends_with(shim_ext)) {
+                        activeName += shim_ext;
+                    }
+                    const auto activeBin =
+                        std::filesystem::path(resolved->path)
+                        / activeName;
+                    if (std::filesystem::exists(activeBin)) {
+                        // The same writer `xlings use xlings <v>` goes through.
+                        // Two independent replacements of the one file every shim
+                        // dispatches through is how a home ends up running a
+                        // client nobody chose -- see entry_binary.cppm.
+                        entry_binary::replace_with(
+                            activeBin, xlings_bin,
+                            std::format("{}@{}", resolved->target, effect.version),
+                            effect.version);
+                    }
+                    xself::compat::v0_4_8::cleanup_legacy_alias_shims(
+                        binDir, xlings_bin);
+                }
+                continue;
+            }
+            if (resolved->kind == XpkgFilesystemEffectKind::FileAsset) {
+                if (!resolved->active) {
+                    log::debug("[xim] file asset {}@{} not placed: not the "
+                               "active version", resolved->target,
+                               resolved->version);
+                    continue;
+                }
+                if (const auto file = xvm::file_placement(
+                        scopedDb, resolved->target, resolved->version,
+                        Config::paths().homeDir.string());
+                    !file.empty()) {
+                    xvm::place_asset(file.source,
+                                     subosDir / file.destination);
+                } else {
+                    log::warn("[xim] file asset {}@{} declares no usable "
+                              "destination; nothing placed",
+                              resolved->target, resolved->version);
+                }
+                continue;
+            }
+            if (resolved->kind != XpkgFilesystemEffectKind::Library
+                || resolved->path.empty()) {
+                continue;
+            }
+            if (!resolved->active) {
+                // Installing a version that does not become active must not
+                // disturb the sysroot. `InstallHeaders` has been gated this way
+                // since 0.4.70; `Library` was not, so installing a second version
+                // of a package overwrote the active version's library while its
+                // headers stayed put -- the sysroot then held a library from one
+                // release beside headers from another, which compiles and fails
+                // at run time. `xlings use` is what moves libraries.
+                log::debug("[xim] library {}@{} not placed: not the active "
+                           "version", resolved->target, resolved->version);
+                continue;
+            }
+
+            const auto source =
+                std::filesystem::path(resolved->path)
+                / resolved->sourceName;
+            const auto destination =
+                libDir / resolved->destinationName;
+            std::filesystem::create_directories(libDir);
+            std::error_code ec;
+            if (std::filesystem::exists(destination, ec)
+                || std::filesystem::is_symlink(destination, ec)) {
+                std::filesystem::remove(destination, ec);
+            }
+            ec.clear();
+            if (std::filesystem::exists(source, ec)) {
+                std::filesystem::create_symlink(
+                    source, destination, ec);
+            }
         }
-        ec.clear();
-        if (std::filesystem::exists(source, ec)) {
-            std::filesystem::create_symlink(
-                source, destination, ec);
-        }
+    };
+
+    place_effects_into(artifactSubosDir, scopedWorkspace, scopedInstalled);
+
+    // A registration rewrite (e.g. `remove` + `install` for the same
+    // version, or a recipe update that changes a release's declared paths)
+    // must not leave every OTHER subos that pins this version with dangling
+    // sysroot links -- the loop above only ever touched the subos this
+    // command is running in. `find_subos_pinning_version` is the same
+    // predicate `xlings remove`'s "pinned by" reporting already uses
+    // (xim/commands.cpp): active OR installed[], either pins the payload
+    // just as hard. It only ever considers `<home>/subos/*` (see
+    // `load_subos_snapshots`), never a project-scoped subos, so resolving
+    // each name against `homeDir / "subos" / name` below matches exactly
+    // what produced it.
+    //
+    // Deliberately NOT `ScopedSubosOverride` / `Config::set_active_subos_
+    // override` here, and not just because xim.commands (which owns the
+    // guard) imports xim.installer, making that a module cycle. Measured
+    // directly: the override's own reload (`Config::reload_state()`, needed
+    // on every transition or `Config::workspace()` reads one subos stale --
+    // see its comment in config.cpp) re-reads `globalVersions_` from
+    // `~/.xlings.json` on disk. That clobbers `scopedDb` -- a REFERENCE to
+    // that same member -- with whatever was there before this call, because
+    // `Config::save_versions()` for THIS batch has not run yet (it happens
+    // once, after this whole loop). The library branch below then resolves
+    // `resolved->path` from the stale pre-batch entry, silently placing
+    // nothing for every other subos while headers still moved (their source
+    // path rides on `effect.sourceDir`, captured before the DB write, not
+    // looked up through `scopedDb`). So: read each other subos's own
+    // workspace file directly -- read-only, and the version DB it is
+    // resolved against stays the one this batch just registered.
+    for (const auto& otherSubos : xlings::profile::find_subos_pinning_version(
+             Config::paths().homeDir, node.name, node.version)) {
+        if (otherSubos == Config::paths().activeSubos) continue;
+        const auto otherSubosDir =
+            Config::paths().homeDir / "subos" / otherSubos;
+        auto sws = load_workspace_file_(otherSubosDir / ".xlings.json");
+        place_effects_into(otherSubosDir, sws.active, sws.installed);
     }
 
     cleanup_removed_xvm_program_artifacts(

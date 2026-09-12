@@ -194,6 +194,11 @@ TESTS=(
     # recipe's uninstall() runs, and --force/--all/--all-subos make "removed"
     # mean removed no matter what shape the home is in (2026.9.12 Task 5).
     "E2E-102|remove_force_contract_test.sh||"
+    # A registration rewrite (remove + reinstall of the same target@version)
+    # refreshes the sysroot of every subos that pins that version, not only
+    # the subos the command ran in -- and must not push the package into a
+    # subos that never had it (2026.9.12 Task 7, #586).
+    "E2E-105|sysroot_refresh_pinning_subos_test.sh||"
 )
 
 # ── orphan check: a test that runs NOWHERE looks exactly like one that passes ──
