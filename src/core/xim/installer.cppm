@@ -395,6 +395,16 @@ bool has_directory_entries_(const std::filesystem::path& dir);
 bool stage_extracted_payload_(const std::filesystem::path& extractRoot,
                               const std::filesystem::path& installDir);
 
+// A private, per-installation extraction directory: same volume as
+// `runtimeDir` (so stage_extracted_payload_'s move is a rename, not a
+// cross-filesystem copy), named for one plan key and this process so two
+// concurrent installs of the same package cannot collide. The plan key is
+// sanitized to a single safe path component -- it carries ':' from a
+// namespaced name (`xim:gcc@13.3.0`), which is not legal in a Windows
+// path.
+std::filesystem::path private_stage_dir_(const std::filesystem::path& runtimeDir,
+                                         std::string_view planKey);
+
 bool normalize_file_install_(const std::filesystem::path& installPath);
 
 class ScopedCurrentDir_ {
@@ -405,6 +415,22 @@ public:
     explicit ScopedCurrentDir_(const std::filesystem::path& newDir);
 
     ~ScopedCurrentDir_();
+};
+
+// Removes a directory tree on destruction, whether staging into it
+// succeeded or failed. Used for the private extraction directory above:
+// stage_extracted_payload_ has already emptied it out entry by entry on
+// success, and nothing downstream may still expect it to exist either
+// way.
+class ScopedStageDir_ {
+    std::filesystem::path dir_;
+
+public:
+    explicit ScopedStageDir_(std::filesystem::path dir);
+    ScopedStageDir_(const ScopedStageDir_&) = delete;
+    ScopedStageDir_& operator=(const ScopedStageDir_&) = delete;
+
+    ~ScopedStageDir_();
 };
 
 std::filesystem::path current_workspace_config_path_();

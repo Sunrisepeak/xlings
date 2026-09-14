@@ -40,6 +40,37 @@ std::string_view executable_format_(const std::filesystem::path& file);
 // nothing here".
 bool payload_has_content(const std::filesystem::path& dir);
 
+// The fingerprint a hookless install used to leave when it staged from the
+// shared download directory instead of its own archive (mcpp-community/
+// mcpp#636, fixed by xpkg-manifest-v1 §6 / installer.cpp's private
+// extraction): a download-cache sidecar, or another package's archive,
+// sitting at the top level of what should be one package's own files.
+//
+// Anchored on the lock file, not on any filename by itself: a package may
+// legitimately ship its OWN top-level "setup.exe", "data.zip" or
+// "notes.meta" as part of its own archive, and none of those names alone
+// is evidence of anything. What only the downloader ever writes, and only
+// inside runtimedir (downloader.cpp), is a zero-length "<name>.lock" held
+// for the download's duration -- a genuine payload has no reason to carry
+// one. So every candidate is a zero-length regular file "<name>.lock",
+// and it counts as the fingerprint only when one of three further, non-
+// recursive facts about "<name>" also holds (measured shapes, any one
+// sufficient):
+//
+//   * "<name>" exists as a sibling here too -- the archive beside its own
+//     lock, e.g. "hooked.tar.gz" + "hooked.tar.gz.lock";
+//   * "<name>" itself ends in one of the extensions the downloader names
+//     its destination file with -- true even when the archive side was
+//     already moved or the download never finished, e.g. an orphan
+//     "glibc-2.44.2-linux-x86_64.tar.gz.lock";
+//   * "<name>.meta" exists as a sibling -- the downloader's per-file
+//     sidecar, corroborating a non-archive download such as
+//     "LICENSE.TXT" + "LICENSE.TXT.lock".
+//
+// Returns the lock file's own name (the evidence), or "" when the top
+// level carries no zero-length lock file satisfying any of the three.
+std::string swept_payload_marker(const std::filesystem::path& dir);
+
 // What the FILES say, ignoring any stamp. Separate from the function below
 // because "should this payload be stamped" must never be answered by reading
 // the stamp: a run that wrote one over a payload it did not actually install

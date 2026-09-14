@@ -81,6 +81,11 @@ namespace fs = std::filesystem;
 //   - broken payload → the ladder in xself/repair.cppm: re-register, then
 //     remove-and-reinstall, then -- when the entry is provably dead and the
 //     ladder could not revive it -- prune the registration.
+//   - swept payload (another package's archive or download-cache sidecar
+//     left inside this one, mcpp-community/mcpp#636) → the same ladder, forced
+//     straight to remove-and-reinstall: the payload is already registered
+//     and on disk, so the ladder's cheap first rung would read as healed
+//     without touching the contamination.
 //   - alias warning  → not auto-fixed (could be intentional external).
 //   - baked subos path in an alias/env → rewritten to the active subos.
 //     This is NOT the exception above: `alias unresolved` might be a system
@@ -254,6 +259,18 @@ enum class FindingKind {
     // wreckage, so `xlings install` skipped the hook and reported success
     // forever. See xim/install_state.cppm.
     IncompletePayload,
+    // A payload whose top level carries the fingerprint of mcpp-community/mcpp#636: a
+    // download-cache sidecar, or another package's archive, that a hookless
+    // install used to sweep in from the shared runtime directory instead of
+    // extracting its own archive privately. See xim::swept_payload_marker.
+    //
+    // Reported at Error and repaired the same way IncompletePayload is --
+    // by re-running install() -- because that is what applies the fix: a
+    // reinstall now stages from a private extraction (installer.cpp) and
+    // ends up with exactly the entries the package's own archive lays
+    // down, nothing swept in beside them. See repair_incomplete_, which
+    // this finding is routed through unchanged.
+    SweptPayload,
     // A payload that carries a stamp from before the stamp recorded what it
     // registered, and that the version database does not reference at all.
     //

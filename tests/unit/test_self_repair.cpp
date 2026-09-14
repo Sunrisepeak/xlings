@@ -70,6 +70,39 @@ TEST(SelfRepairLadder, ReRegisterAloneIsEnoughWhenInstallSucceeds) {
     EXPECT_FALSE(f.overran);
 }
 
+// A SweptPayload task must never stop at R2: the payload it describes is
+// already registered and on disk (that is the whole reason
+// repair_incomplete_ alone cannot fix one -- see doctor.cpp's
+// repair_swept_), so an `install` that trivially succeeds there is "already
+// installed", not a repair. Verified by the exact command sequence: R2 must
+// not even run.
+TEST(SelfRepairLadder, SweptPayloadSkipsReRegisterAndGoesStraightToRemoveAndInstall) {
+    FakeRunner f{.codes = {0, 0}};   // remove ok, install ok -- only two calls
+    auto t = task();
+    t.kind = RepairKind::SweptPayload;
+    auto r = repair_one(t, RepairPolicy{}, runner_of(f),
+                        [](const std::string&, const std::string&) {
+                            return true;    // really gone
+                        });
+
+    EXPECT_TRUE(r.healed);
+    EXPECT_EQ(r.rung, "reinstall");
+    ASSERT_EQ(f.ran.size(), 2u) << "R2 must not run for a swept payload";
+    EXPECT_EQ(f.ran[0], "xlings remove linux-headers@5.11.1 --force -y");
+    EXPECT_EQ(f.ran[1], "xlings install linux-headers@5.11.1 -y");
+}
+
+// A BrokenPayload task is unaffected: R2 still runs and can still heal on
+// its own, exactly as before this kind existed.
+TEST(SelfRepairLadder, BrokenPayloadStillTriesReRegisterFirst) {
+    FakeRunner f{.codes = {0}};
+    auto r = repair_one(task(), RepairPolicy{}, runner_of(f));
+
+    EXPECT_TRUE(r.healed);
+    EXPECT_EQ(r.rung, "re-register");
+    ASSERT_EQ(f.ran.size(), 1u);
+}
+
 // ---------------------------------------------------------------- R3
 
 TEST(SelfRepairLadder, FallsBackToRemoveThenInstall) {

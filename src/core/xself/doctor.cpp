@@ -1824,6 +1824,25 @@ Scan detect_(const DoctorState& st, const CoordinateProbe& probe,
                             });
                             continue;
                         }
+                        if (const auto culprit =
+                                xim::swept_payload_marker(verDir.path());
+                                !culprit.empty()) {
+                            add({
+                                .kind    = FindingKind::SweptPayload,
+                                .level   = FindingLevel::Error,
+                                .target  = name,
+                                .version = version,
+                                .detail  = std::format(
+                                    "{} carries '{}' at its top level -- a "
+                                    "hookless install used to sweep the "
+                                    "whole download directory into the "
+                                    "package instead of staging its own "
+                                    "archive privately (mcpp-community/mcpp#636)",
+                                    coordinate, culprit),
+                                .remedy  = remedy,
+                            });
+                            continue;
+                        }
                         if (xim::unverifiable_stamped_payload(
                                 ledgerIndex, ns, name, version,
                                 verDir.path())) {
@@ -3701,6 +3720,13 @@ void repair_inactive_(const Scan& scan, const std::string& client,
 // `installation_state` report Incomplete, which is what makes the installer
 // run the hook again instead of concluding "already installed" from the files
 // the failure left behind.
+//
+// NOT used for FindingKind::SweptPayload, even though that finding is also
+// store-derived and also carries an `xlings install <coordinate>` remedy: a
+// swept payload's version database entry already agrees with it (nothing
+// marked it incomplete, because nothing failed -- the sweep happened
+// DURING a successful-looking install), so a plain reinstall would see
+// "already installed" and exit 0 having touched nothing. See repair_swept_.
 void repair_incomplete_(const Scan& scan, const std::string& client,
                         const CommandRunner& run,
                         bool dryRun, RepairReport& out,
@@ -3758,6 +3784,133 @@ void repair_incomplete_(const Scan& scan, const std::string& client,
                 std::format("{} — run `{}` to see why",
                             xvm::display_coordinate(f.target, f.version),
                             f.remedy));
+        }
+    }
+}
+
+// Repairs a FindingKind::SweptPayload: a payload that reads as successfully
+// installed -- its version database entry agrees with the files on disk --
+// but whose top level still carries another package's archive or
+// download-cache sidecar (mcpp-community/mcpp#636, see xim::swept_payload_marker).
+//
+// R2 of the usual ladder (`xlings install <coordinate>` alone) is exactly
+// the operation that produced this state's false "installed" reading in
+// the first place: the installer sees a non-empty, already-registered
+// install_dir and does nothing further, so calling it again would report
+// this repair "healed" while the swept-in files stayed exactly where they
+// were. `repair_one` skips R2 for RepairKind::SweptPayload for that
+// reason and goes straight to R3: remove, then install. The removal
+// empties install_dir; the install that follows reaches the
+// private-extraction staging fallback (installer.cpp) with nothing
+// already sitting there, and ends up with exactly the entries of the
+// package's own archive -- a fresh install under xpkg-manifest-v1 §6.
+//
+// Not routed through repair_payloads_'s owning_coordinate_ grouping, for
+// the same reason repair_incomplete_ is not (see there): this finding
+// comes from the store, and its coordinate -- namespace included -- was
+// already recovered from the store layout when the finding was made.
+void repair_swept_(const Scan& scan, const std::string& client,
+                   const CommandRunner& run,
+                   bool dryRun, RepairReport& out,
+                   const std::function<void(std::string_view)>& onStep = {},
+                   xim::PackageCatalog* catalogForDependents = nullptr) {
+    for (const auto& f : scan.findings) {
+        if (f.kind != FindingKind::SweptPayload) continue;
+        if (f.remedy.empty()) continue;
+        // `f.remedy` is `"xlings install <coordinate>"`; the coordinate is
+        // the last word and, unlike the namespace-vs-target split
+        // elsewhere, is what both R3 commands below and the reinstallable
+        // probe need whole.
+        const auto sep = f.remedy.rfind(' ');
+        const auto coordinate = sep == std::string::npos
+            ? f.remedy : f.remedy.substr(sep + 1);
+        if (!is_shell_safe_token(coordinate)) {
+            out.notes.emplace_back(
+                glyph::mark(glyph::failed, "reinstall skipped"),
+                std::format("{} — its coordinate is not a safe shell token",
+                            xvm::display_coordinate(f.target, f.version)));
+            continue;
+        }
+
+        if (dryRun) {
+            out.planned.push_back(std::format(
+                "remove {} then reinstall it (clears a swept download "
+                "directory)", coordinate));
+            continue;
+        }
+
+        if (onStep) {
+            onStep(std::format(
+                "repairing {} — removing and reinstalling to clear a swept "
+                "download directory (this may download)", coordinate));
+        }
+
+        const RemovalVerifier removalDone =
+            [&](const std::string& target, const std::string& version) {
+                Config::reload_state();
+                const auto current = Config::versions();
+                const auto* vi = xvm::get_vinfo(current, target);
+                return !(vi && vi->versions.contains(version));
+            };
+        DependentsProvider dependentsOf;
+        if (catalogForDependents) {
+            dependentsOf = [&](const std::string& depTarget) {
+                auto xd = xim::direct_dependents_of(*catalogForDependents,
+                                                    depTarget);
+                std::vector<Dependent> deps;
+                deps.reserve(xd.size());
+                for (auto& d : xd) deps.push_back({d.name, d.version});
+                return deps;
+            };
+        }
+
+        RepairPolicy policy;
+        policy.client = client;
+        // "Can the index supply this package again" -- the same question
+        // `probe_reinstallable` asks, asked here with the whole coordinate
+        // (namespace included) rather than that helper's bare target@version,
+        // because a store-derived finding may be namespaced and `xlings info`
+        // resolves the same coordinate grammar `install`/`remove` do.
+        const bool reinstallable =
+            run(std::format("{} info {}{}", client, coordinate,
+                            quiet_suffix())) == 0;
+        RepairTask task{
+            .kind          = RepairKind::SweptPayload,
+            .target        = f.target,
+            .version       = f.version,
+            .detail        = f.detail,
+            .coordinate    = coordinate,
+            .reinstallable = reinstallable,
+        };
+        auto result = repair_one(task, policy, run, removalDone, dependentsOf);
+        if (!result.healed) {
+            out.failedEntries.emplace_back(f.target, f.version);
+            // Same terminal-outcome check repair_payloads_ makes for R3: did
+            // `remove --force` actually drop the record while the reinstall
+            // meant to follow it failed too.
+            if (result.rung == "reinstall" && removalDone
+                && removalDone(f.target, f.version)) {
+                out.removedNotReinstalled.push_back(coordinate);
+                if (!result.dependents.empty()) {
+                    std::string names;
+                    for (const auto& d : result.dependents) {
+                        if (!names.empty()) names += ", ";
+                        names += std::format("{}@{}", d.name, d.version);
+                    }
+                    out.notes.emplace_back(
+                        glyph::mark(glyph::failed, "may be broken"),
+                        std::format(
+                            "{} may be broken -- {} depended on {}, which "
+                            "is now gone and could not be put back",
+                            names,
+                            result.dependents.size() == 1 ? "it" : "they",
+                            coordinate));
+                }
+            }
+            out.notes.emplace_back(glyph::mark(glyph::failed, "repair failed"),
+                std::format("{} — {}", coordinate,
+                    result.note.empty() ? "the finding it covers is still there"
+                                        : result.note));
         }
     }
 }
@@ -4290,6 +4443,11 @@ Counts count_(const Scan& scan) {
                 // that --fix repairs reports "healed 0".
                 ++c.broken;
                 break;
+            // Counted the same way and for the same two reasons as
+            // IncompletePayload just above.
+            case FindingKind::SweptPayload:
+                ++c.broken;
+                break;
             case FindingKind::UnverifiedPayload:
                 // Counts as nothing, on purpose. It is a Notice about state we
                 // could not observe, not a defect we found -- and a home with
@@ -4650,6 +4808,13 @@ void render_(const Scan& scan, const RepairReport& repair, bool fix,
                 break;
             case FindingKind::IncompletePayload:
                 add(glyph::mark(glyph::failed, "incomplete install"), f.detail);
+                if (!f.remedy.empty())
+                    add("  " + glyph::mark(glyph::remedy, "run"), f.remedy);
+                if (!f.remedyNote.empty())
+                    add("  " + glyph::mark(glyph::note, "note"), f.remedyNote);
+                break;
+            case FindingKind::SweptPayload:
+                add(glyph::mark(glyph::failed, "swept payload"), f.detail);
                 if (!f.remedy.empty())
                     add("  " + glyph::mark(glyph::remedy, "run"), f.remedy);
                 if (!f.remedyNote.empty())
@@ -5188,6 +5353,7 @@ int cmd_doctor(EventStream& stream, bool fix, bool resetMetadata, bool dryRun, b
         repair_local_(state, scan, repair, /*dryRun=*/true);
         repair_payloads_(state, scan, probe, /*dryRun=*/true, repair);
         repair_incomplete_(scan, client, run, /*dryRun=*/true, repair);
+        repair_swept_(scan, client, run, /*dryRun=*/true, repair);
         repair_inactive_(scan, client, run, /*dryRun=*/true, repair);
         if (!alreadyAnchored) {
             repair_other_subos_walk_(scan, client, /*dryRun=*/true, run,
@@ -5273,6 +5439,13 @@ int cmd_doctor(EventStream& stream, bool fix, bool resetMetadata, bool dryRun, b
     repair_incomplete_(scan, client, run, /*dryRun=*/false, repair, announce);
     refresh();
 
+    // Phase 2c: payloads swept in from the shared runtime directory
+    // (mcpp-community/mcpp#636). Also after a reload, for the same reason -- a
+    // payload this repairs removes and reinstalls must be re-read before
+    // anything downstream asks whether it is still there.
+    repair_swept_(scan, client, run, /*dryRun=*/false, repair, announce,
+                 localCatalog ? &*localCatalog : nullptr);
+    refresh();
 
     // Phase 3: the cheap repairs again, on what the ladder left behind.
     //
@@ -5377,7 +5550,12 @@ int cmd_doctor(EventStream& stream, bool fix, bool resetMetadata, bool dryRun, b
             // does. Before this, a home whose ONLY remaining defect was a
             // failed reinstall could stamp `verifiedBy` and exit 0 while
             // install() had never actually succeeded.
-            || f.kind == FindingKind::IncompletePayload) {
+            || f.kind == FindingKind::IncompletePayload
+            // Same reasoning as IncompletePayload just above, for
+            // repair_swept_'s remove-then-reinstall: a failure there
+            // leaves the sweep fingerprint on disk, re-detected the same
+            // way.
+            || f.kind == FindingKind::SweptPayload) {
             stillFound.emplace(f.target, f.version);
         }
     }

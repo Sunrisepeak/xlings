@@ -1118,3 +1118,273 @@ TEST(DepVersionMatchTest, NonSemverVersionsMatchByEquality) {
     EXPECT_TRUE(dep_version_matches_("deadbeef", "deadbeef"));
     EXPECT_FALSE(dep_version_matches_("deadbeef", "cafebabe"));
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// detail_::stage_extracted_payload_ — the staging function
+// mcpp-community/mcpp#636 is about (xpkg-manifest-v1 §6): a hookless
+// install must receive exactly the entries of its own archive, laid out
+// as the archive lays them out.
+//
+// Before the fix this function had a second branch that collapsed a
+// SINGLE top-level directory onto installDir directly, stripping it. That
+// branch was unreachable as long as its caller was ever handed the shared
+// runtime directory (a download's archive file always sat beside the
+// extracted tree, so entries.size() was never 1) -- dead code, not a
+// feature. Calling this function directly, bypassing that accident, is
+// exactly how the deleted branch would have shown up: these tests are the
+// regression guard for its removal.
+// ─────────────────────────────────────────────────────────────────────
+
+namespace {
+
+fs::path make_stage_dir(const std::string& name) {
+    auto dir = fs::temp_directory_path() / ("xlings-stage-" + name);
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    return dir;
+}
+
+}  // namespace
+
+TEST(StageExtractedPayloadTest, KeepsASingleTopLevelDirectoryUnstripped) {
+    using xlings::xim::detail_::stage_extracted_payload_;
+
+    auto extractRoot = make_stage_dir("single-top-extract");
+    auto installDir  = make_stage_dir("single-top-install");
+    fs::remove_all(installDir);   // stage_extracted_payload_ may create it
+
+    fs::create_directories(extractRoot / "gcc-13.3.0" / "bin");
+    xlings::platform::write_string_to_file(
+        (extractRoot / "gcc-13.3.0" / "bin" / "gcc").string(), "binary");
+
+    EXPECT_TRUE(stage_extracted_payload_(extractRoot, installDir));
+
+    // Kept, not stripped: the archive's own top-level directory is a
+    // subdirectory of installDir, exactly as xpkg-manifest-v1 §6 requires.
+    EXPECT_TRUE(fs::is_regular_file(
+        installDir / "gcc-13.3.0" / "bin" / "gcc"));
+    // The old stripping branch would have placed this at installDir/bin/gcc
+    // directly; assert that layout did NOT happen.
+    EXPECT_FALSE(fs::exists(installDir / "bin"));
+
+    fs::remove_all(extractRoot);
+    fs::remove_all(installDir);
+}
+
+TEST(StageExtractedPayloadTest, MovesEveryTopLevelEntryOfAMultiEntryArchive) {
+    using xlings::xim::detail_::stage_extracted_payload_;
+
+    auto extractRoot = make_stage_dir("multi-top-extract");
+    auto installDir  = make_stage_dir("multi-top-install");
+    fs::remove_all(installDir);
+
+    fs::create_directories(extractRoot / "bin");
+    fs::create_directories(extractRoot / "lib");
+    xlings::platform::write_string_to_file(
+        (extractRoot / "bin" / "tool").string(), "binary");
+    xlings::platform::write_string_to_file(
+        (extractRoot / "README.md").string(), "docs");
+
+    EXPECT_TRUE(stage_extracted_payload_(extractRoot, installDir));
+
+    EXPECT_TRUE(fs::is_regular_file(installDir / "bin" / "tool"));
+    EXPECT_TRUE(fs::is_directory(installDir / "lib"));
+    EXPECT_TRUE(fs::is_regular_file(installDir / "README.md"));
+
+    fs::remove_all(extractRoot);
+    fs::remove_all(installDir);
+}
+
+TEST(StageExtractedPayloadTest, AnAlreadyNonEmptyInstallDirIsLeftUntouched) {
+    using xlings::xim::detail_::stage_extracted_payload_;
+
+    auto extractRoot = make_stage_dir("noop-extract");
+    auto installDir  = make_stage_dir("noop-install");
+
+    fs::create_directories(extractRoot / "payload");
+    xlings::platform::write_string_to_file(
+        (installDir / "already-here").string(), "sentinel");
+
+    EXPECT_TRUE(stage_extracted_payload_(extractRoot, installDir));
+
+    // The pre-existing file survived, and nothing from extractRoot landed:
+    // a non-empty installDir short-circuits, it is never merged into.
+    EXPECT_TRUE(fs::is_regular_file(installDir / "already-here"));
+    EXPECT_FALSE(fs::exists(installDir / "payload"));
+
+    fs::remove_all(extractRoot);
+    fs::remove_all(installDir);
+}
+
+TEST(StageExtractedPayloadTest, AnEmptyExtractRootFails) {
+    using xlings::xim::detail_::stage_extracted_payload_;
+
+    auto extractRoot = make_stage_dir("empty-extract");
+    auto installDir  = make_stage_dir("empty-install");
+    fs::remove_all(installDir);
+
+    EXPECT_FALSE(stage_extracted_payload_(extractRoot, installDir));
+
+    fs::remove_all(extractRoot);
+    fs::remove_all(installDir);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// detail_::private_stage_dir_ — the per-installation extraction directory
+// a hookless (or hook-that-did-nothing) install stages from. Same volume
+// as runtimeDir, sanitized to a single safe path component, unique per
+// process so two concurrent installs of the same package cannot collide.
+// ─────────────────────────────────────────────────────────────────────
+
+TEST(PrivateStageDirTest, LivesUnderADotStageSubdirectoryOfRuntimeDir) {
+    using xlings::xim::detail_::private_stage_dir_;
+
+    auto runtimeDir = fs::path("/home/x/.xlings/data/runtimedir");
+    auto dir = private_stage_dir_(runtimeDir, "xim:gcc@13.3.0");
+
+    EXPECT_EQ(dir.parent_path().parent_path(), runtimeDir);
+    EXPECT_EQ(dir.parent_path().filename(), ".stage");
+}
+
+TEST(PrivateStageDirTest, SanitizesCharactersAWindowsPathCannotCarry) {
+    using xlings::xim::detail_::private_stage_dir_;
+
+    auto dir = private_stage_dir_("/runtimedir", "xim:gcc@13.3.0");
+    auto name = dir.filename().string();
+
+    EXPECT_EQ(name.find(':'), std::string::npos);
+    EXPECT_EQ(name.find('@'), std::string::npos);
+    // The sanitized plan key is still a recognizable prefix of the name.
+    EXPECT_EQ(name.rfind("xim_gcc_13.3.0-", 0), 0u);
+}
+
+TEST(PrivateStageDirTest, TwoDifferentPlanKeysNeverCollide) {
+    using xlings::xim::detail_::private_stage_dir_;
+
+    auto a = private_stage_dir_("/runtimedir", "xim:gcc@13.3.0");
+    auto b = private_stage_dir_("/runtimedir", "xim:gcc@16.1.0");
+    EXPECT_NE(a, b);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// xim::swept_payload_marker — the sweep fingerprint doctor's
+// FindingKind::SweptPayload is built on (mcpp-community/mcpp#636).
+//
+// Anchored on a zero-length "<name>.lock" (only the downloader ever
+// writes one, and only in runtimedir): a filename ALONE, however much it
+// looks like a download, must never be enough -- a package's own archive
+// can legitimately carry a top-level "setup.exe" or "data.zip" as its own
+// content. The negative cases here are the regression guard for exactly
+// that false positive.
+// ─────────────────────────────────────────────────────────────────────
+
+namespace {
+
+fs::path make_marker_dir(const std::string& name) {
+    auto dir = fs::temp_directory_path() / ("xlings-swept-" + name);
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    return dir;
+}
+
+void write_zero_length(const fs::path& file) {
+    std::ofstream(file, std::ios::binary);  // open + close: 0 bytes
+}
+
+}  // namespace
+
+TEST(SweptPayloadMarkerTest, ADownloadShapedNameAloneIsNotFlagged) {
+    using xlings::xim::swept_payload_marker;
+
+    auto dir = make_marker_dir("names-alone");
+    xlings::platform::write_string_to_file(
+        (dir / "setup.exe").string(), "not a download, just this package's own file");
+    xlings::platform::write_string_to_file(
+        (dir / "data.zip").string(), "also this package's own content");
+    xlings::platform::write_string_to_file(
+        (dir / "notes.meta").string(), "package-authored metadata, not a sidecar");
+    // A NON-empty "*.lock" -- e.g. a bundled yarn.lock -- must not match
+    // either: the anchor requires the lock file itself to be zero-length.
+    xlings::platform::write_string_to_file(
+        (dir / "yarn.lock").string(), "# THIS IS AN AUTOGENERATED FILE...\n");
+
+    EXPECT_EQ(swept_payload_marker(dir), "");
+    fs::remove_all(dir);
+}
+
+TEST(SweptPayloadMarkerTest, FlagsAZeroLengthLockPairedWithItsSibling) {
+    using xlings::xim::swept_payload_marker;
+
+    auto dir = make_marker_dir("sibling-pair");
+    xlings::platform::write_string_to_file(
+        (dir / "hooked.tar.gz").string(), "archive bytes");
+    write_zero_length(dir / "hooked.tar.gz.lock");
+
+    EXPECT_EQ(swept_payload_marker(dir), "hooked.tar.gz.lock");
+    fs::remove_all(dir);
+}
+
+TEST(SweptPayloadMarkerTest, FlagsAnOrphanLockWhoseBaseIsADownloadName) {
+    using xlings::xim::swept_payload_marker;
+
+    // The archive side already moved (or the download never finished),
+    // leaving only the lock -- exactly the measured
+    // "glibc-2.44.2-linux-x86_64.tar.gz.lock" shape.
+    auto dir = make_marker_dir("orphan-lock");
+    write_zero_length(dir / "glibc-2.44.2-linux-x86_64.tar.gz.lock");
+
+    EXPECT_EQ(swept_payload_marker(dir), "glibc-2.44.2-linux-x86_64.tar.gz.lock");
+    fs::remove_all(dir);
+}
+
+TEST(SweptPayloadMarkerTest, FlagsALockCorroboratedByAMetaSidecarAlone) {
+    using xlings::xim::swept_payload_marker;
+
+    // Neither a sibling "LICENSE.TXT" nor a download-shaped extension --
+    // only the downloader's own ".meta" sidecar corroborates the lock.
+    auto dir = make_marker_dir("meta-only");
+    write_zero_length(dir / "LICENSE.TXT.lock");
+    xlings::platform::write_string_to_file(
+        (dir / "LICENSE.TXT.meta").string(), "{\"size\":1071}");
+
+    EXPECT_EQ(swept_payload_marker(dir), "LICENSE.TXT.lock");
+    fs::remove_all(dir);
+}
+
+TEST(SweptPayloadMarkerTest, ANonEmptyLockIsNotFlagged) {
+    using xlings::xim::swept_payload_marker;
+
+    auto dir = make_marker_dir("nonempty-lock");
+    xlings::platform::write_string_to_file(
+        (dir / "hooked.tar.gz").string(), "archive bytes");
+    // Not zero-length: the anchor is specifically what the downloader's
+    // FileLock leaves behind, and that lock is always empty.
+    xlings::platform::write_string_to_file(
+        (dir / "hooked.tar.gz.lock").string(), "pid=12345\n");
+
+    EXPECT_EQ(swept_payload_marker(dir), "");
+    fs::remove_all(dir);
+}
+
+TEST(SweptPayloadMarkerTest, ADirectoryNamedLikeALockIsNotFlagged) {
+    using xlings::xim::swept_payload_marker;
+
+    auto dir = make_marker_dir("dir-not-file");
+    fs::create_directories(dir / "hooked.tar.gz.lock");
+
+    EXPECT_EQ(swept_payload_marker(dir), "");
+    fs::remove_all(dir);
+}
+
+TEST(SweptPayloadMarkerTest, ACleanPayloadIsNotFlagged) {
+    using xlings::xim::swept_payload_marker;
+
+    auto dir = make_marker_dir("clean");
+    fs::create_directories(dir / "bin");
+    xlings::platform::write_string_to_file((dir / "bin" / "tool").string(), "binary");
+    xlings::platform::write_string_to_file(
+        (dir / ".xpkg-install.json").string(), "{}");
+
+    EXPECT_EQ(swept_payload_marker(dir), "");
+    fs::remove_all(dir);
+}
