@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# xlings#634 A, 2.5: `xlings self doctor` reports a payload whose top level
+# mcpp-community/mcpp#636, 2.5: `xlings self doctor` reports a payload whose top level
 # still carries the fingerprint of the sweep defect (a foreign archive, or
 # a download-cache `.lock`/`.meta` sidecar, left inside a package that
 # never asked for a download of its own) -- and `--fix` repairs it by
@@ -107,10 +107,26 @@ rc=0; clean_out="$(RUN self doctor 2>&1)" || rc=$?
 echo "$clean_out" | strip_ansi | grep -qi "swept" \
   && { echo "$clean_out"; fail "D1: a clean install must not be reported as swept"; }
 
-log "seeding the sweep fingerprint: a foreign archive and a zero-length .lock sidecar"
-# Shape 1: a download/archive-extension filename -- exactly what another
-# package's cached download looks like.
-printf 'not really a tarball\n' > "$PAYLOAD_DIR/other-pkg-2.1.0.tar.gz"
+log "D1.5: a BYSTANDER file -- looks like a download, has no .lock --"
+log "  must NOT be flagged (the false positive the anchor rules out)"
+# A package can legitimately carry a top-level file that merely LOOKS
+# like a download (an installer asset, a bundled sub-archive) as part of
+# its own, genuine archive. Without a paired .lock, xim::
+# swept_payload_marker's anchor must never fire on a name alone.
+printf 'legitimate payload content\n' > "$PAYLOAD_DIR/bundled-asset.tar.gz"
+rc=0; bystander_out="$(RUN self doctor 2>&1)" || rc=$?
+[[ $rc -eq 0 ]] \
+  || { echo "$bystander_out"; fail "D1.5: a bystander download-shaped filename with no .lock must not fail doctor; rc=$rc"; }
+echo "$bystander_out" | strip_ansi | grep -qi "swept" \
+  && { echo "$bystander_out"; fail "D1.5: FALSE POSITIVE -- a lone bundled-asset.tar.gz with no .lock must not be reported as swept"; }
+
+log "seeding the sweep fingerprint: two shapes, both anchored on a"
+log "  zero-length .lock (downloader.cpp writes .lock only in runtimedir)"
+# Shape 1: an ORPHAN lock -- the archive side already moved or the
+# download never finished, but the lock's own base name ends in a
+# download extension, e.g. "glibc-2.44.2-linux-x86_64.tar.gz.lock" with
+# no "glibc-2.44.2-linux-x86_64.tar.gz" beside it.
+: > "$PAYLOAD_DIR/other-pkg-2.1.0.tar.gz.lock"
 # Shape 2: a zero-length "<name>.lock" paired with a sibling "<name>" --
 # exactly what the downloader's FileLock leaves in runtimedir, and ONLY
 # in runtimedir (downloader.cpp), so one inside a payload is unexplained
@@ -137,8 +153,10 @@ echo "$fixout" | tail -30 | sed 's/^/    | /'
 log "D4: the directory now equals a fresh install"
 [[ -f "$PAYLOAD_DIR/bin/tool" ]] \
   || fail "D4: swept-fixture's own file (bin/tool) did not survive the repair"
-[[ ! -e "$PAYLOAD_DIR/other-pkg-2.1.0.tar.gz" ]] \
-  || fail "D4: the foreign archive survived --fix"
+[[ ! -e "$PAYLOAD_DIR/bundled-asset.tar.gz" ]] \
+  || fail "D4: the bystander file survived --fix (it was never part of swept-fixture's own archive)"
+[[ ! -e "$PAYLOAD_DIR/other-pkg-2.1.0.tar.gz.lock" ]] \
+  || fail "D4: the orphan .lock survived --fix"
 [[ ! -e "$PAYLOAD_DIR/another-package-9.9.9" ]] \
   || fail "D4: the foreign directory survived --fix"
 [[ ! -e "$PAYLOAD_DIR/another-package-9.9.9.lock" ]] \

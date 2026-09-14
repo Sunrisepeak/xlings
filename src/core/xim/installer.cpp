@@ -3143,6 +3143,9 @@ std::expected<void, std::string> Installer::execute(const InstallPlan& plan, con
         if (!payloadInstalled && !detail_::has_directory_entries_(ctx.install_dir)
             && dlIt != downloadResults.end()
             && detail_::is_archive_(dlIt->second.localFile)) {
+            if (onStatus) {
+                onStatus({ node.name, InstallPhase::Extracting, 0.35f, "" });
+            }
             const auto stageDir = detail_::private_stage_dir_(
                 detail_::runtime_dir_(node, dataDir), planKey);
             detail_::ScopedStageDir_ stageGuard(stageDir);

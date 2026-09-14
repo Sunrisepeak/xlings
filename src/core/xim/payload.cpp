@@ -74,25 +74,50 @@ std::string swept_payload_marker(const std::filesystem::path& dir) {
     }
     if (ec) return {};
 
+    // The anchor is the lock file, not the archive name: a package may
+    // legitimately ship its own top-level "setup.exe", "data.zip" or
+    // "notes.meta" as PART of its own archive, and none of those alone
+    // says anything about a sweep. What the downloader -- and only the
+    // downloader -- leaves is a zero-length "<X>.lock" (downloader.cpp;
+    // held for the download's duration, never written anywhere but
+    // runtimedir). Every entry that is not one of those zero-length
+    // lock files is skipped outright, whatever its own name looks like.
     for (const auto& entry : entries) {
         const auto filename = entry.path().filename().string();
+        if (!filename.ends_with(".lock")) continue;
 
+        std::error_code fec;
+        if (!entry.is_regular_file(fec) || fec) continue;
+        fec.clear();
+        if (entry.file_size(fec) != 0 || fec) continue;
+
+        const auto base = filename.substr(0, filename.size() - 5);
+        if (base.empty()) continue;
+
+        // Given a zero-length lock, any one of three shapes measured on a
+        // real swept store confirms it is the download's, not some
+        // unrelated zero-length ".lock" a build happens to produce:
+        //   * "<base>" is right here too -- the archive beside its lock,
+        //     e.g. "hooked.tar.gz" + "hooked.tar.gz.lock";
+        //   * "<base>" itself ends in a download/archive extension, which
+        //     is true even when the archive side was already moved or
+        //     never finished -- an orphan
+        //     "glibc-2.44.2-linux-x86_64.tar.gz.lock";
+        //   * "<base>.meta" is here -- the downloader's per-file sidecar,
+        //     corroborating a non-archive download such as
+        //     "LICENSE.TXT" + "LICENSE.TXT.lock".
+        const bool siblingPresent = names.contains(base);
+        bool baseIsDownloadName = false;
         for (const auto ext : kDownloadExtensions_) {
-            if (filename.size() > ext.size() && filename.ends_with(ext)) {
-                return filename;
+            if (base.size() > ext.size() && base.ends_with(ext)) {
+                baseIsDownloadName = true;
+                break;
             }
         }
+        const bool metaSiblingPresent = names.contains(base + ".meta");
 
-        if (filename.ends_with(".meta")) return filename;
-
-        if (filename.ends_with(".lock")) {
-            const auto base = filename.substr(0, filename.size() - 5);
-            std::error_code fec;
-            if (!base.empty() && names.contains(base)
-                && entry.is_regular_file(fec) && !fec
-                && entry.file_size(fec) == 0 && !fec) {
-                return filename;
-            }
+        if (siblingPresent || baseIsDownloadName || metaSiblingPresent) {
+            return filename;
         }
     }
     return {};

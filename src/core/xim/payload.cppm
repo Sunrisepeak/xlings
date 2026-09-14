@@ -41,32 +41,34 @@ std::string_view executable_format_(const std::filesystem::path& file);
 bool payload_has_content(const std::filesystem::path& dir);
 
 // The fingerprint a hookless install used to leave when it staged from the
-// shared download directory instead of its own archive (xlings#634 A,
-// fixed by xpkg-manifest-v1 §6 / installer.cpp's private extraction): a
-// download-cache sidecar, or another package's archive, sitting at the top
-// level of what should be one package's own files.
+// shared download directory instead of its own archive (mcpp-community/
+// mcpp#636, fixed by xpkg-manifest-v1 §6 / installer.cpp's private
+// extraction): a download-cache sidecar, or another package's archive,
+// sitting at the top level of what should be one package's own files.
 //
-// Non-recursive by design -- the sweep always carried its evidence in as a
-// SIBLING of the package's own top-level entries, never nested inside one
-// of them. Three independent tells, any one of which is sufficient:
+// Anchored on the lock file, not on any filename by itself: a package may
+// legitimately ship its OWN top-level "setup.exe", "data.zip" or
+// "notes.meta" as part of its own archive, and none of those names alone
+// is evidence of anything. What only the downloader ever writes, and only
+// inside runtimedir (downloader.cpp), is a zero-length "<name>.lock" held
+// for the download's duration -- a genuine payload has no reason to carry
+// one. So every candidate is a zero-length regular file "<name>.lock",
+// and it counts as the fingerprint only when one of three further, non-
+// recursive facts about "<name>" also holds (measured shapes, any one
+// sufficient):
 //
-//   * a zero-length regular file "<name>.lock" whose "<name>" also exists
-//     here. The downloader creates "<file>.lock" only inside runtimedir
-//     (downloader.cpp), holds it for the download's duration, and a
-//     genuine payload has no reason to carry one at all -- so one paired
-//     with a same-named sibling did not arrive by any path this package's
-//     own install produces.
-//   * a file "<name>.meta" -- the downloader's per-file sidecar, written
-//     only beside a download in runtimedir.
-//   * an entry whose name ends in one of the extensions the downloader
-//     names its destination file with -- an archive format
-//     extract_archive_detailed understands, or an opaque installer format
-//     (.exe, .msi, .deb, .rpm, .dmg, .pkg, .AppImage, .run) an install()
-//     hook would have consumed rather than left lying beside its own
-//     output.
+//   * "<name>" exists as a sibling here too -- the archive beside its own
+//     lock, e.g. "hooked.tar.gz" + "hooked.tar.gz.lock";
+//   * "<name>" itself ends in one of the extensions the downloader names
+//     its destination file with -- true even when the archive side was
+//     already moved or the download never finished, e.g. an orphan
+//     "glibc-2.44.2-linux-x86_64.tar.gz.lock";
+//   * "<name>.meta" exists as a sibling -- the downloader's per-file
+//     sidecar, corroborating a non-archive download such as
+//     "LICENSE.TXT" + "LICENSE.TXT.lock".
 //
-// Returns the offending entry's name, or "" when the top level carries
-// none of the three.
+// Returns the lock file's own name (the evidence), or "" when the top
+// level carries no zero-length lock file satisfying any of the three.
 std::string swept_payload_marker(const std::filesystem::path& dir);
 
 // What the FILES say, ignoring any stamp. Separate from the function below

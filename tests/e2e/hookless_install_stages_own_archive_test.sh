@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# xlings#634 A / xpkg-manifest-v1 §6: a package without an install() hook
+# mcpp-community/mcpp#636 / xpkg-manifest-v1 §6: a package without an install() hook
 # must receive exactly the entries of its own archive, laid out as the
 # archive lays them out, and nothing else -- and the archive stays in the
 # download cache (runtimedir).

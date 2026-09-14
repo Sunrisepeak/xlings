@@ -27,7 +27,7 @@ enum class RepairKind {
     BrokenPayload,
     // The registered payload resolves fine -- the version database agrees
     // with it -- but its top level still carries another package's
-    // archive or download-cache sidecar (xlings#634 A: a hookless install
+    // archive or download-cache sidecar (mcpp-community/mcpp#636: a hookless install
     // used to stage from the shared runtime directory instead of its own
     // archive, doctor.cppm's FindingKind::SweptPayload). R2 alone
     // (`xlings install`) is a false "healed": the installer sees an

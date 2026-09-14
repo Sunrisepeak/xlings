@@ -241,7 +241,7 @@ TESTS=(
     "E2E-110|doctor_cross_subos_child_timeout_test.sh||"
     # A package without an install() hook used to stage from the SHARED
     # runtime directory, sweeping every other package's archive and
-    # download-cache sidecar into its own install_dir (xlings#634 A).
+    # download-cache sidecar into its own install_dir (mcpp-community/mcpp#636).
     # Fixed by a private, per-installation extraction
     # (xpkg-manifest-v1 §6).
     "E2E-111|hookless_install_stages_own_archive_test.sh||"

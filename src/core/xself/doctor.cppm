@@ -82,7 +82,7 @@ namespace fs = std::filesystem;
 //     remove-and-reinstall, then -- when the entry is provably dead and the
 //     ladder could not revive it -- prune the registration.
 //   - swept payload (another package's archive or download-cache sidecar
-//     left inside this one, xlings#634 A) → the same ladder, forced
+//     left inside this one, mcpp-community/mcpp#636) → the same ladder, forced
 //     straight to remove-and-reinstall: the payload is already registered
 //     and on disk, so the ladder's cheap first rung would read as healed
 //     without touching the contamination.
@@ -259,7 +259,7 @@ enum class FindingKind {
     // wreckage, so `xlings install` skipped the hook and reported success
     // forever. See xim/install_state.cppm.
     IncompletePayload,
-    // A payload whose top level carries the fingerprint of xlings#634 A: a
+    // A payload whose top level carries the fingerprint of mcpp-community/mcpp#636: a
     // download-cache sidecar, or another package's archive, that a hookless
     // install used to sweep in from the shared runtime directory instead of
     // extracting its own archive privately. See xim::swept_payload_marker.

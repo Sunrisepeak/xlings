@@ -1837,7 +1837,7 @@ Scan detect_(const DoctorState& st, const CoordinateProbe& probe,
                                     "hookless install used to sweep the "
                                     "whole download directory into the "
                                     "package instead of staging its own "
-                                    "archive privately (xlings#634)",
+                                    "archive privately (mcpp-community/mcpp#636)",
                                     coordinate, culprit),
                                 .remedy  = remedy,
                             });
@@ -3791,7 +3791,7 @@ void repair_incomplete_(const Scan& scan, const std::string& client,
 // Repairs a FindingKind::SweptPayload: a payload that reads as successfully
 // installed -- its version database entry agrees with the files on disk --
 // but whose top level still carries another package's archive or
-// download-cache sidecar (xlings#634 A, see xim::swept_payload_marker).
+// download-cache sidecar (mcpp-community/mcpp#636, see xim::swept_payload_marker).
 //
 // R2 of the usual ladder (`xlings install <coordinate>` alone) is exactly
 // the operation that produced this state's false "installed" reading in
@@ -5440,7 +5440,7 @@ int cmd_doctor(EventStream& stream, bool fix, bool resetMetadata, bool dryRun, b
     refresh();
 
     // Phase 2c: payloads swept in from the shared runtime directory
-    // (xlings#634 A). Also after a reload, for the same reason -- a
+    // (mcpp-community/mcpp#636). Also after a reload, for the same reason -- a
     // payload this repairs removes and reinstalls must be re-read before
     // anything downstream asks whether it is still there.
     repair_swept_(scan, client, run, /*dryRun=*/false, repair, announce,
