@@ -25,6 +25,15 @@ enum class RepairKind {
     StaleRegistration,
     // The registered payload does not resolve to an executable on disk.
     BrokenPayload,
+    // The registered payload resolves fine -- the version database agrees
+    // with it -- but its top level still carries another package's
+    // archive or download-cache sidecar (xlings#634 A: a hookless install
+    // used to stage from the shared runtime directory instead of its own
+    // archive, doctor.cppm's FindingKind::SweptPayload). R2 alone
+    // (`xlings install`) is a false "healed": the installer sees an
+    // already-registered, non-empty payload and does nothing, so
+    // `repair_one` skips it for this kind and goes straight to R3.
+    SweptPayload,
 };
 
 struct RepairTask {
@@ -174,6 +183,11 @@ std::optional<std::string> migration_hint(std::string_view recorded,
 //                   payload intact this re-runs config() only -- no download
 //                   -- and that is exactly what converts a 0.4.69 record into
 //                   the current format.
+//
+//                   Skipped entirely for RepairKind::SweptPayload: that
+//                   payload already passes the same shortcut (it IS on
+//                   disk, and the database agrees), so R2 would report
+//                   "healed" without removing what a sweep left beside it.
 //
 //   R3 reinstall    `xlings remove …` then `xlings install …`
 //                   For the case R2 cannot reach: a record the registration

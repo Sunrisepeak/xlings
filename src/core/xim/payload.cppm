@@ -40,6 +40,35 @@ std::string_view executable_format_(const std::filesystem::path& file);
 // nothing here".
 bool payload_has_content(const std::filesystem::path& dir);
 
+// The fingerprint a hookless install used to leave when it staged from the
+// shared download directory instead of its own archive (xlings#634 A,
+// fixed by xpkg-manifest-v1 §6 / installer.cpp's private extraction): a
+// download-cache sidecar, or another package's archive, sitting at the top
+// level of what should be one package's own files.
+//
+// Non-recursive by design -- the sweep always carried its evidence in as a
+// SIBLING of the package's own top-level entries, never nested inside one
+// of them. Three independent tells, any one of which is sufficient:
+//
+//   * a zero-length regular file "<name>.lock" whose "<name>" also exists
+//     here. The downloader creates "<file>.lock" only inside runtimedir
+//     (downloader.cpp), holds it for the download's duration, and a
+//     genuine payload has no reason to carry one at all -- so one paired
+//     with a same-named sibling did not arrive by any path this package's
+//     own install produces.
+//   * a file "<name>.meta" -- the downloader's per-file sidecar, written
+//     only beside a download in runtimedir.
+//   * an entry whose name ends in one of the extensions the downloader
+//     names its destination file with -- an archive format
+//     extract_archive_detailed understands, or an opaque installer format
+//     (.exe, .msi, .deb, .rpm, .dmg, .pkg, .AppImage, .run) an install()
+//     hook would have consumed rather than left lying beside its own
+//     output.
+//
+// Returns the offending entry's name, or "" when the top level carries
+// none of the three.
+std::string swept_payload_marker(const std::filesystem::path& dir);
+
 // What the FILES say, ignoring any stamp. Separate from the function below
 // because "should this payload be stamped" must never be answered by reading
 // the stamp: a run that wrote one over a payload it did not actually install

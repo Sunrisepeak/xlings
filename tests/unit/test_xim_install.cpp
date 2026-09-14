@@ -1118,3 +1118,149 @@ TEST(DepVersionMatchTest, NonSemverVersionsMatchByEquality) {
     EXPECT_TRUE(dep_version_matches_("deadbeef", "deadbeef"));
     EXPECT_FALSE(dep_version_matches_("deadbeef", "cafebabe"));
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// detail_::stage_extracted_payload_ — the staging function xlings#634 A is
+// about (xpkg-manifest-v1 §6): a hookless install must receive exactly the
+// entries of its own archive, laid out as the archive lays them out.
+//
+// Before the fix this function had a second branch that collapsed a
+// SINGLE top-level directory onto installDir directly, stripping it. That
+// branch was unreachable as long as its caller was ever handed the shared
+// runtime directory (a download's archive file always sat beside the
+// extracted tree, so entries.size() was never 1) -- dead code, not a
+// feature. Calling this function directly, bypassing that accident, is
+// exactly how the deleted branch would have shown up: these tests are the
+// regression guard for its removal.
+// ─────────────────────────────────────────────────────────────────────
+
+namespace {
+
+fs::path make_stage_dir(const std::string& name) {
+    auto dir = fs::temp_directory_path() / ("xlings-stage-" + name);
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    return dir;
+}
+
+}  // namespace
+
+TEST(StageExtractedPayloadTest, KeepsASingleTopLevelDirectoryUnstripped) {
+    using xlings::xim::detail_::stage_extracted_payload_;
+
+    auto extractRoot = make_stage_dir("single-top-extract");
+    auto installDir  = make_stage_dir("single-top-install");
+    fs::remove_all(installDir);   // stage_extracted_payload_ may create it
+
+    fs::create_directories(extractRoot / "gcc-13.3.0" / "bin");
+    xlings::platform::write_string_to_file(
+        (extractRoot / "gcc-13.3.0" / "bin" / "gcc").string(), "binary");
+
+    EXPECT_TRUE(stage_extracted_payload_(extractRoot, installDir));
+
+    // Kept, not stripped: the archive's own top-level directory is a
+    // subdirectory of installDir, exactly as xpkg-manifest-v1 §6 requires.
+    EXPECT_TRUE(fs::is_regular_file(
+        installDir / "gcc-13.3.0" / "bin" / "gcc"));
+    // The old stripping branch would have placed this at installDir/bin/gcc
+    // directly; assert that layout did NOT happen.
+    EXPECT_FALSE(fs::exists(installDir / "bin"));
+
+    fs::remove_all(extractRoot);
+    fs::remove_all(installDir);
+}
+
+TEST(StageExtractedPayloadTest, MovesEveryTopLevelEntryOfAMultiEntryArchive) {
+    using xlings::xim::detail_::stage_extracted_payload_;
+
+    auto extractRoot = make_stage_dir("multi-top-extract");
+    auto installDir  = make_stage_dir("multi-top-install");
+    fs::remove_all(installDir);
+
+    fs::create_directories(extractRoot / "bin");
+    fs::create_directories(extractRoot / "lib");
+    xlings::platform::write_string_to_file(
+        (extractRoot / "bin" / "tool").string(), "binary");
+    xlings::platform::write_string_to_file(
+        (extractRoot / "README.md").string(), "docs");
+
+    EXPECT_TRUE(stage_extracted_payload_(extractRoot, installDir));
+
+    EXPECT_TRUE(fs::is_regular_file(installDir / "bin" / "tool"));
+    EXPECT_TRUE(fs::is_directory(installDir / "lib"));
+    EXPECT_TRUE(fs::is_regular_file(installDir / "README.md"));
+
+    fs::remove_all(extractRoot);
+    fs::remove_all(installDir);
+}
+
+TEST(StageExtractedPayloadTest, AnAlreadyNonEmptyInstallDirIsLeftUntouched) {
+    using xlings::xim::detail_::stage_extracted_payload_;
+
+    auto extractRoot = make_stage_dir("noop-extract");
+    auto installDir  = make_stage_dir("noop-install");
+
+    fs::create_directories(extractRoot / "payload");
+    xlings::platform::write_string_to_file(
+        (installDir / "already-here").string(), "sentinel");
+
+    EXPECT_TRUE(stage_extracted_payload_(extractRoot, installDir));
+
+    // The pre-existing file survived, and nothing from extractRoot landed:
+    // a non-empty installDir short-circuits, it is never merged into.
+    EXPECT_TRUE(fs::is_regular_file(installDir / "already-here"));
+    EXPECT_FALSE(fs::exists(installDir / "payload"));
+
+    fs::remove_all(extractRoot);
+    fs::remove_all(installDir);
+}
+
+TEST(StageExtractedPayloadTest, AnEmptyExtractRootFails) {
+    using xlings::xim::detail_::stage_extracted_payload_;
+
+    auto extractRoot = make_stage_dir("empty-extract");
+    auto installDir  = make_stage_dir("empty-install");
+    fs::remove_all(installDir);
+
+    EXPECT_FALSE(stage_extracted_payload_(extractRoot, installDir));
+
+    fs::remove_all(extractRoot);
+    fs::remove_all(installDir);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// detail_::private_stage_dir_ — the per-installation extraction directory
+// a hookless (or hook-that-did-nothing) install stages from. Same volume
+// as runtimeDir, sanitized to a single safe path component, unique per
+// process so two concurrent installs of the same package cannot collide.
+// ─────────────────────────────────────────────────────────────────────
+
+TEST(PrivateStageDirTest, LivesUnderADotStageSubdirectoryOfRuntimeDir) {
+    using xlings::xim::detail_::private_stage_dir_;
+
+    auto runtimeDir = fs::path("/home/x/.xlings/data/runtimedir");
+    auto dir = private_stage_dir_(runtimeDir, "xim:gcc@13.3.0");
+
+    EXPECT_EQ(dir.parent_path().parent_path(), runtimeDir);
+    EXPECT_EQ(dir.parent_path().filename(), ".stage");
+}
+
+TEST(PrivateStageDirTest, SanitizesCharactersAWindowsPathCannotCarry) {
+    using xlings::xim::detail_::private_stage_dir_;
+
+    auto dir = private_stage_dir_("/runtimedir", "xim:gcc@13.3.0");
+    auto name = dir.filename().string();
+
+    EXPECT_EQ(name.find(':'), std::string::npos);
+    EXPECT_EQ(name.find('@'), std::string::npos);
+    // The sanitized plan key is still a recognizable prefix of the name.
+    EXPECT_EQ(name.rfind("xim_gcc_13.3.0-", 0), 0u);
+}
+
+TEST(PrivateStageDirTest, TwoDifferentPlanKeysNeverCollide) {
+    using xlings::xim::detail_::private_stage_dir_;
+
+    auto a = private_stage_dir_("/runtimedir", "xim:gcc@13.3.0");
+    auto b = private_stage_dir_("/runtimedir", "xim:gcc@16.1.0");
+    EXPECT_NE(a, b);
+}

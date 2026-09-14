@@ -47,6 +47,57 @@ bool payload_has_content(const std::filesystem::path& dir) {
     return false;
 }
 
+namespace {
+
+// Extensions the downloader names a destination file with (a URL's own
+// trailing component, downloader.cpp), and so the extensions a sweep can
+// carry into a payload that never asked for a download of its own.
+constexpr std::string_view kDownloadExtensions_[] = {
+    ".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.bz2", ".tbz2", ".tar.zst",
+    ".zip", ".7z", ".AppImage", ".run", ".exe", ".msi", ".deb", ".rpm",
+    ".dmg", ".pkg",
+};
+
+}  // namespace
+
+std::string swept_payload_marker(const std::filesystem::path& dir) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (!fs::is_directory(dir, ec)) return {};
+
+    std::vector<fs::directory_entry> entries;
+    std::set<std::string> names;
+    for (auto it = fs::directory_iterator(dir, ec);
+         !ec && it != std::default_sentinel; it.increment(ec)) {
+        names.insert(it->path().filename().string());
+        entries.push_back(*it);
+    }
+    if (ec) return {};
+
+    for (const auto& entry : entries) {
+        const auto filename = entry.path().filename().string();
+
+        for (const auto ext : kDownloadExtensions_) {
+            if (filename.size() > ext.size() && filename.ends_with(ext)) {
+                return filename;
+            }
+        }
+
+        if (filename.ends_with(".meta")) return filename;
+
+        if (filename.ends_with(".lock")) {
+            const auto base = filename.substr(0, filename.size() - 5);
+            std::error_code fec;
+            if (!base.empty() && names.contains(base)
+                && entry.is_regular_file(fec) && !fec
+                && entry.file_size(fec) == 0 && !fec) {
+                return filename;
+            }
+        }
+    }
+    return {};
+}
+
 PayloadPlatform classify_payload_content(const std::filesystem::path& dir) {
     namespace fs = std::filesystem;
     std::error_code ec;

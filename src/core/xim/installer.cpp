@@ -1131,11 +1131,6 @@ bool stage_extracted_payload_(const std::filesystem::path& extractRoot,
     }
     if (ec || entries.empty()) return false;
 
-    fs::path payloadRoot = extractRoot;
-    if (entries.size() == 1 && fs::is_directory(entries.front(), ec) && !ec) {
-        payloadRoot = entries.front();
-    }
-
     if (fs::exists(installDir, ec)) {
         if (fs::is_empty(installDir, ec)) {
             ec.clear();
@@ -1146,18 +1141,19 @@ bool stage_extracted_payload_(const std::filesystem::path& extractRoot,
         }
     }
 
-    fs::create_directories(installDir.parent_path(), ec);
-    if (ec) return false;
-
-    if (payloadRoot != extractRoot) {
-        fs::rename(payloadRoot, installDir, ec);
-        if (!ec) return true;
-        ec.clear();
-    }
-
     fs::create_directories(installDir, ec);
     if (ec) return false;
 
+    // Every entry of extractRoot is staged as-is, archive top-level
+    // directory included: xpkg-manifest-v1 §6 is explicit that a hookless
+    // install's layout is the archive's own, unstripped. There used to be
+    // a branch here that collapsed a single top-level directory onto
+    // installDir directly -- dead code as long as extractRoot was the
+    // shared runtime directory (a download always sat beside it, so
+    // entries.size() was never 1), and wrong now that extractRoot is a
+    // private, single-archive extraction where that branch would actually
+    // run and strip the very layout this function exists to preserve. See
+    // the staging call site for why extractRoot is always private.
     auto move_entry = [&](const fs::path& source) -> bool {
         auto dest = installDir / source.filename();
         fs::rename(source, dest, ec);
@@ -1172,23 +1168,24 @@ bool stage_extracted_payload_(const std::filesystem::path& extractRoot,
         return !ec;
     };
 
-    if (payloadRoot == extractRoot) {
-        for (auto& entry : entries) {
-            if (!move_entry(entry)) return false;
-        }
-        return true;
-    }
-
-    std::vector<fs::path> payloadEntries;
-    for (fs::directory_iterator it(payloadRoot, ec);
-         !ec && it != std::default_sentinel; it.increment(ec)) {
-        payloadEntries.push_back(it->path());
-    }
-    if (ec) return false;
-    for (auto& entry : payloadEntries) {
+    for (auto& entry : entries) {
         if (!move_entry(entry)) return false;
     }
     return true;
+}
+
+std::filesystem::path private_stage_dir_(const std::filesystem::path& runtimeDir,
+                                         std::string_view planKey) {
+    std::string sanitized;
+    sanitized.reserve(planKey.size());
+    for (char c : planKey) {
+        sanitized += (std::isalnum(static_cast<unsigned char>(c))
+                      || c == '-' || c == '.')
+            ? c : '_';
+    }
+    if (sanitized.empty()) sanitized = "pkg";
+    return runtimeDir / ".stage"
+        / std::format("{}-{}", sanitized, platform::get_pid());
 }
 
 bool normalize_file_install_(const std::filesystem::path& installPath) {
@@ -2433,6 +2430,14 @@ ScopedCurrentDir_::~ScopedCurrentDir_() {
     std::filesystem::current_path(oldDir_, ec);
 }
 
+ScopedStageDir_::ScopedStageDir_(std::filesystem::path dir) : dir_(std::move(dir)) {}
+
+ScopedStageDir_::~ScopedStageDir_() {
+    if (dir_.empty()) return;
+    std::error_code ec;
+    std::filesystem::remove_all(dir_, ec);
+}
+
 } // namespace xlings::xim::detail_
 
 namespace xlings::xim {
@@ -2810,7 +2815,6 @@ std::expected<void, std::string> Installer::execute(const InstallPlan& plan, con
         auto planKey = detail_::plan_key_(node);
         auto dlIt = downloadResults.find(planKey);
 
-        std::optional<std::filesystem::path> extractedRoot;
         if (plannedDownloads.contains(planKey) && dlIt == downloadResults.end()) {
             log::error("download artifact missing for {}", node.name);
             if (onStatus) {
@@ -2823,13 +2827,26 @@ std::expected<void, std::string> Installer::execute(const InstallPlan& plan, con
         // relative paths and determining project install locations.
         ctx.run_dir = std::filesystem::current_path();
 
+        // Whether install() will run for this node. Extracting beside the
+        // archive in the shared runtime directory is the install hook's
+        // contract, not a general one: the example at xpkg-manifest-v1 §8.2
+        // derives the extracted directory from install_file() (e.g.
+        // `install_file():replace(".tar.xz", "")`), which only resolves to
+        // something if extraction happened there first. A package with no
+        // install hook never gets that shared-directory extraction -- it
+        // stages from a private one instead, at the point staging actually
+        // runs (below), and per xpkg-manifest-v1 §6 that is the only thing
+        // it receives.
+        const bool hasInstallHook =
+            executor.has_hook(mcpplibs::xpkg::HookType::Install);
+
         if (dlIt != downloadResults.end()) {
             ctx.install_file = dlIt->second.localFile;
-            if (detail_::is_archive_(dlIt->second.localFile)) {
+            if (hasInstallHook && detail_::is_archive_(dlIt->second.localFile)) {
                 if (onStatus) {
                     onStatus({ node.name, InstallPhase::Extracting, 0.35f, "" });
                 }
-                // Extract into the same runtime dir as the download
+                // Extract into the same runtime dir as the download.
                 auto runtimeDir = dlIt->second.localFile.parent_path();
                 auto extracted = extract_archive_detailed(
                     dlIt->second.localFile, runtimeDir);
@@ -2850,7 +2867,6 @@ std::expected<void, std::string> Installer::execute(const InstallPlan& plan, con
                     }
                     continue;
                 }
-                extractedRoot = *extracted;
             }
         }
         // No download artifact: install_file stays empty (type-only packages
@@ -3113,8 +3129,43 @@ std::expected<void, std::string> Installer::execute(const InstallPlan& plan, con
             }
         }
 
-        if (!payloadInstalled && extractedRoot && !detail_::has_directory_entries_(ctx.install_dir)) {
-            if (!detail_::stage_extracted_payload_(*extractedRoot, ctx.install_dir)) {
+        // Staging: install_dir is still empty after every hook that ran
+        // above. Two shapes reach here -- a package with no install hook at
+        // all, and one whose hook left install_dir empty (a tarball with no
+        // top-level directory of its own, e.g. the patchelf case noted below
+        // at the auto-stamp comment, where the hook's own os.mv has nothing
+        // to move). Either way the archive is (re-)extracted into a private
+        // directory unique to this installation and staged from there. This
+        // deliberately never reads the shared runtime directory: that
+        // directory holds every package's downloads and sidecars, and
+        // stage_extracted_payload_ moves EVERY entry it is given
+        // (xpkg-manifest-v1 §6).
+        if (!payloadInstalled && !detail_::has_directory_entries_(ctx.install_dir)
+            && dlIt != downloadResults.end()
+            && detail_::is_archive_(dlIt->second.localFile)) {
+            const auto stageDir = detail_::private_stage_dir_(
+                detail_::runtime_dir_(node, dataDir), planKey);
+            detail_::ScopedStageDir_ stageGuard(stageDir);
+
+            auto extracted = extract_archive_detailed(
+                dlIt->second.localFile, stageDir);
+            if (!extracted) {
+                auto error = std::move(extracted).error();
+                if (evict_invalid_archive_cache_(
+                        dlIt->second.localFile, error)) {
+                    log::warn("evicted invalid archive cache for {}: {}",
+                              node.name, dlIt->second.localFile.string());
+                }
+                log::error("extract failed for {}: {}",
+                           node.name, error.message);
+                if (onStatus) {
+                    onStatus({ node.name, InstallPhase::Failed, 0.0f,
+                               error.message });
+                }
+                continue;
+            }
+
+            if (!detail_::stage_extracted_payload_(*extracted, ctx.install_dir)) {
                 log::error("failed to stage extracted payload for {}", node.name);
                 write_payload_failure_marker(
                     ctx.install_dir, node.version,

@@ -79,8 +79,14 @@ RepairResult repair_one(const RepairTask& task, const RepairPolicy& policy, cons
     const auto remove  = std::format("{} remove {} --force -y",
                                      policy.client, coordinate);
 
-    // R2
-    if (run(install) == 0) return {true, "re-register", {}};
+    // R2. Skipped for SweptPayload: that payload's directory is already
+    // non-empty and already registered, so `xlings install` would exit 0
+    // having found "nothing to do" and this rung would report the finding
+    // healed while the files a sweep left beside the package's own stayed
+    // exactly where they were. See RepairKind::SweptPayload.
+    if (task.kind != RepairKind::SweptPayload && run(install) == 0) {
+        return {true, "re-register", {}};
+    }
 
     // R3
     if (!policy.allowReinstall) {
