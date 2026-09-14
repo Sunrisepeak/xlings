@@ -239,6 +239,17 @@ TESTS=(
     # bounded (XLINGS_DOCTOR_CHILD_TIMEOUT, default 30 min) and reported
     # as a failure, not silently waited on forever (2026.9.12 finding F8).
     "E2E-110|doctor_cross_subos_child_timeout_test.sh||"
+    # A package without an install() hook used to stage from the SHARED
+    # runtime directory, sweeping every other package's archive and
+    # download-cache sidecar into its own install_dir (xlings#634 A).
+    # Fixed by a private, per-installation extraction
+    # (xpkg-manifest-v1 §6).
+    "E2E-111|hookless_install_stages_own_archive_test.sh||"
+    # `xlings self doctor` now reports a payload already swept by the
+    # 2026.9.12.1-and-earlier defect above, and `--fix` repairs it
+    # through the reinstall ladder forced straight to remove-then-
+    # install (RepairKind::SweptPayload skips R2 in repair.cpp).
+    "E2E-112|doctor_swept_payload_test.sh||"
 )
 
 # ── orphan check: a test that runs NOWHERE looks exactly like one that passes ──
