@@ -11,11 +11,11 @@ version = "1.0.8"
 source  = "index+compat@1.0.8"
 hash    = "fnv1a:3672c2797c5f2faf"
 
-[package."ftxui"]
+[package."compat.ftxui"]
 namespace = "compat"
 version = "6.1.9"
 source  = "index+compat@6.1.9"
-hash    = "fnv1a:6ecc43e2f9201d7d"
+hash    = "fnv1a:f4f0f58dc9107814"
 
 [package."compat.libarchive"]
 namespace = "compat"

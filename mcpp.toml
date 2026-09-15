@@ -89,7 +89,6 @@ linkage = "static"
 linkage = "static"
 
 [dependencies]
-ftxui = "6.1.9"
 theme        = { path = "modules/theme" }
 platform     = { path = "modules/platform" }
 cancellation = { path = "modules/cancellation" }
@@ -102,6 +101,7 @@ sha256       = { path = "modules/sha256" }
 xhttp        = { path = "modules/tinyhttps" }
 
 [dependencies.compat]
+ftxui      = "6.1.9"
 libarchive = "3.8.7"
 
 [dependencies.mcpplibs]
@@ -109,7 +109,7 @@ cmdline = "0.0.2"
 xpkg = "0.0.57"
 capi.lua = "0.0.3"
 
-[dev-dependencies]
+[dev-dependencies.compat]
 gtest = "1.15.2"
 
 # Sanitizer profile for CI (`mcpp test --profile asan`). Not a default: the
